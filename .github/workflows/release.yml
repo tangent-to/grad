@@ -109,6 +109,10 @@ jobs:
     name: Refresh the suite site's API reference
     needs: [npm, jsr]
     runs-on: ubuntu-latest
+    # Never let a documentation refresh mark a successful publish as failed.
+    # The packages are on npm and JSR by the time this runs; the worst case here
+    # is that the site's API reference waits for its weekly schedule.
+    continue-on-error: true
     steps:
       # The site keeps a generated API reference per package, committed so its
       # build never needs the package repos. A release changes that reference,
@@ -128,7 +132,14 @@ jobs:
             echo 'change up on its weekly schedule instead.'
             exit 0
           fi
-          gh api repos/tangent-to/suite/dispatches \
-            -f event_type=api-update \
-            -F "client_payload[package]=${{ github.event.repository.name }}" \
-            -F "client_payload[tag]=${{ github.ref_name }}"
+          if ! gh api repos/tangent-to/suite/dispatches \
+                 -f event_type=api-update \
+                 -F "client_payload[package]=${{ github.event.repository.name }}" \
+                 -F "client_payload[tag]=${{ github.ref_name }}"; then
+            echo '::warning::Could not notify tangent-to/suite. A 401 means the'
+            echo '::warning::SUITE_DISPATCH_TOKEN secret is not a valid token; a 403 or'
+            echo '::warning::404 means it lacks Contents:write on tangent-to/suite.'
+            echo '::warning::The publish itself succeeded; the site will refresh on its'
+            echo '::warning::weekly schedule.'
+            exit 1
+          fi
