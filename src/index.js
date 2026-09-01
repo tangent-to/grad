@@ -22,4 +22,4 @@ export {
   matmul, dot, transpose, diagPart, trace, addDiag, reshape,
 } from './ops.js';
 export { cholesky, triangularSolve, logdetPSD, solvePSD } from './linalg.js';
-export { grad, valueAndGrad } from './api.js';
+export { grad, valueAndGrad, valueAndGradFns } from './api.js';

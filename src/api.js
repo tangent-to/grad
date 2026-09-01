@@ -106,3 +106,68 @@ export function grad(f) {
   const vg = valueAndGrad(f);
   return (x) => vg(x).gradient;
 }
+
+/** Structural equality over a `{name: number|number[]}` parameter map. @private */
+function sameParams(a, b) {
+  if (a === undefined || b === undefined) return false;
+  if (typeof a === 'number') return a === b;
+  if (Array.isArray(a) || a instanceof Float64Array) {
+    if (!(Array.isArray(b) || b instanceof Float64Array) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  if (a === null || typeof a !== 'object') return false;
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) if (!sameParams(a[k], b[k])) return false;
+  return true;
+}
+
+/** Defensive copy of a parameter map, so a caller mutating in place cannot
+ * poison the cache below. @private */
+function copyParams(x) {
+  if (typeof x === 'number') return x;
+  if (Array.isArray(x) || x instanceof Float64Array) return Array.from(x);
+  const out = {};
+  for (const [k, v] of Object.entries(x)) out[k] = copyParams(v);
+  return out;
+}
+
+/**
+ * Split an objective into the SEPARATE value and gradient functions that an
+ * API taking a `(fn, gradFn)` pair expects — `@tangent.to/mc`'s
+ * `model.potential(name, fn, gradFn)` is the case this exists for.
+ *
+ * The two share one evaluation: calling `.value(p)` then `.gradient(p)` on the
+ * same parameters runs the tape once, not twice. That matters because a
+ * sampler's value-and-gradient path calls both in turn, and the forward pass
+ * is a full sweep over the data.
+ *
+ * The cache holds exactly one entry and compares parameters structurally
+ * against a defensive copy, so mutating a parameter array in place invalidates
+ * it correctly rather than returning a stale gradient.
+ *
+ * @param {(x: any) => Var} f - objective built from this package's ops
+ * @returns {{ value: (x:any) => number, gradient: (x:any) => any }}
+ *
+ * @example
+ * const { value, gradient } = valueAndGradFns((p) => logLik(p));
+ * model.potential('y', value, gradient);
+ */
+export function valueAndGradFns(f) {
+  const vg = valueAndGrad(f);
+  let lastInput;
+  let lastResult;
+
+  const evaluate = (x) => {
+    if (lastResult !== undefined && sameParams(lastInput, x)) return lastResult;
+    lastResult = vg(x);
+    lastInput = copyParams(x);
+    return lastResult;
+  };
+
+  return {
+    value: (x) => evaluate(x).value,
+    gradient: (x) => evaluate(x).gradient,
+  };
+}
