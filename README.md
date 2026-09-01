@@ -164,6 +164,7 @@ what a wide Jacobian would want.
 | `valueAndGrad(f)`, `grad(f)` | differentiate a scalar objective |
 | `add` `sub` `mul` `div` `neg` | elementwise arithmetic, scalar broadcasting |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
+| `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
 | `sum` `mean` | reductions to a scalar |
 | `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation |
 | `cholesky` `triangularSolve` `logdetPSD` `solvePSD` | differentiable linear algebra, symmetric positive definite |

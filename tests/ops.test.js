@@ -6,7 +6,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   add, addDiag, diagPart, div, dot, exp, log, matmul, mean, mul, neg, pow,
-  reshape, sigmoid, sqrt, square, sub, sum, tanh, trace, transpose, valueAndGrad, variable,
+  maximum, minimum, relu, reshape, sigmoid, sqrt, square, sub, sum, tanh, trace, transpose,
+  valueAndGrad, variable,
 } from '../src/index.js';
 import { fdGrad } from './_fd.js';
 
@@ -97,6 +98,143 @@ describe('reductions and matrix ops', () => {
     const { gradient } = valueAndGrad((p) => sum(square(addDiag(A, p.a))))({ a: [0.1, 0.2] });
     expect(gradient.a[0]).toBeCloseTo(2 * 2.1, 10);
     expect(gradient.a[1]).toBeCloseTo(2 * 1.7, 10);
+  });
+});
+
+describe('clamps: maximum, minimum, relu', () => {
+  // Deliberately NOT in the elementwise it.each table above. Those cases run
+  // through fdGrad, which straddles each point by +/-1e-6; a test point at or
+  // near a kink would report a mismatch that is the probe's fault, not the
+  // adjoint's. Finite differences are used here only well clear of the tie.
+
+  describe('away from the kink', () => {
+    it.each([
+      ['maximum against a scalar', (v) => sum(maximum(v, 0))],
+      ['minimum against a scalar', (v) => sum(minimum(v, 0))],
+      ['relu', (v) => sum(relu(v))],
+      ['relu composed', (v) => sum(square(relu(sub(v, 0.25))))],
+      ['maximum of two expressions', (v) => sum(maximum(square(v), mul(v, 2)))],
+    ])('%s matches finite differences', (_name, build) => {
+      // Every element sits on one branch or the other, none within 1e-6 of a
+      // tie, and both branches are active within the same vector.
+      agrees(build, [-1.7, 0.9, -0.4, 2.3]);
+    });
+
+    it('routes the adjoint to whichever operand is active, per element', () => {
+      const { gradient } = valueAndGrad((p) => sum(maximum(p.a, p.b)))({
+        a: [3, -1, 5],
+        b: [1, 2, -4],
+      });
+      expect(gradient.a).toEqual([1, 0, 1]);
+      expect(gradient.b).toEqual([0, 1, 0]);
+    });
+  });
+
+  describe('at the kink', () => {
+    // The subgradient here is a documented convention, not something finite
+    // differences could resolve: a central difference straddling the tie
+    // reports the average of the two branches, which is not what any of these
+    // ops promise. Asserted directly instead.
+
+    it("relu'(0) is 0, matching JAX and PyTorch", () => {
+      expect(valueAndGrad((p) => relu(p.x))({ x: 0 }).gradient.x).toBe(0);
+      expect(valueAndGrad((p) => relu(p.x))({ x: 0 }).value).toBe(0);
+    });
+
+    it('maximum sends the whole adjoint left on a tie', () => {
+      const { value, gradient } = valueAndGrad((p) => maximum(p.a, p.b))({ a: 2, b: 2 });
+      expect(value).toBe(2);
+      expect(gradient).toEqual({ a: 1, b: 0 });
+    });
+
+    it('minimum sends the whole adjoint left on a tie', () => {
+      const { value, gradient } = valueAndGrad((p) => minimum(p.a, p.b))({ a: 2, b: 2 });
+      expect(value).toBe(2);
+      expect(gradient).toEqual({ a: 1, b: 0 });
+    });
+
+    it('is not a half-and-half split', () => {
+      // Guards the convention against a future "fairer" rewrite: 0.5/0.5 is
+      // defensible in the abstract and is not what is documented.
+      const { gradient } = valueAndGrad((p) => maximum(p.a, p.b))({ a: 1, b: 1 });
+      expect(gradient.a).not.toBeCloseTo(0.5, 6);
+    });
+
+    it('ties inside a vector all fall the same way', () => {
+      const { gradient } = valueAndGrad((p) => sum(maximum(p.v, 0)))({ v: [0, 0, 0] });
+      expect(gradient.v).toEqual([1, 1, 1]);
+    });
+  });
+
+  describe('broadcasting', () => {
+    it('folds a scalar operand back to a scalar gradient', () => {
+      // The scalar was spread across four elements, so its adjoint is the SUM
+      // of the four contributions, not one of them.
+      const { gradient } = valueAndGrad((p) => sum(maximum([-2, 3, -1, 5], p.k)))({ k: 0 });
+      expect(gradient.k).toBe(2); // two elements below the threshold
+    });
+
+    it('folds a scalar operand on the left too', () => {
+      const { gradient } = valueAndGrad((p) => sum(minimum(p.k, [-2, 3, -1, 5])))({ k: 0 });
+      expect(gradient.k).toBe(2); // k is the smaller one twice
+    });
+
+    it('keeps a matrix operand at its own shape', () => {
+      const { gradient } = valueAndGrad((p) => sum(relu(p.m)))({
+        m: [[-1, 2], [3, -4]],
+      });
+      expect(gradient.m).toEqual([[0, 1], [1, 0]]);
+    });
+
+    it('matches finite differences with a scalar threshold as the variable', () => {
+      const build = (p) => sum(square(maximum([-2.3, 0.7, 1.9, -0.6], p.k)));
+      const { gradient } = valueAndGrad(build)({ k: 0.4 });
+      const fd = fdGrad((v) => valueAndGrad(build)({ k: v[0] }).value, [0.4]);
+      expect(gradient.k).toBeCloseTo(fd[0], 6);
+    });
+  });
+
+  describe('the case these ops exist for', () => {
+    // A quadratic-plateau dose response: g*(1 - relu(1 - x/n)^2). The join sits
+    // at the PARAMETER n, so which observations fall below it moves as the
+    // sampler does, and no precomputed mask can stand in for the clamp. This is
+    // also where a sign or chain-rule slip would hide: the per-op tests above
+    // would all still pass.
+    const X = [0.2, 0.9, 1.6, 2.4, 3.1, 4.2];
+
+    const response = (p) =>
+      mul(p.g, sub(1, square(relu(sub(1, div(X, p.n))))));
+
+    it('differentiates through a parameter-valued join', () => {
+      // n = 2.0 puts three of the six observations below the join and three
+      // above, none closer than 0.4 to it.
+      const at = { g: 1.4, n: 2.0 };
+      const build = (p) => sum(response(p));
+      const { gradient } = valueAndGrad(build)(at);
+
+      const keys = ['g', 'n'];
+      const f = (v) => valueAndGrad(build)({ g: v[0], n: v[1] }).value;
+      const fd = fdGrad(f, keys.map((k) => at[k]));
+      keys.forEach((k, i) => expect(gradient[k]).toBeCloseTo(fd[i], 6));
+    });
+
+    it('gives the plateau a zero gradient in the join', () => {
+      // With every observation above the join the clamp is saturated, so the
+      // response no longer depends on n at all.
+      const { gradient } = valueAndGrad((p) => sum(response(p)))({ g: 1.4, n: 0.1 });
+      expect(gradient.n).toBe(0);
+      expect(gradient.g).toBeCloseTo(X.length, 10);
+    });
+
+    it('still matches finite differences when the join moves', () => {
+      const build = (p) => sum(square(response(p)));
+      for (const n of [0.7, 1.35, 2.85, 3.7]) {
+        const { gradient } = valueAndGrad(build)({ g: 1.4, n });
+        const fd = fdGrad((v) => valueAndGrad(build)({ g: v[0], n: v[1] }).value, [1.4, n]);
+        expect(gradient.g).toBeCloseTo(fd[0], 5);
+        expect(gradient.n).toBeCloseTo(fd[1], 5);
+      }
+    });
   });
 });
 

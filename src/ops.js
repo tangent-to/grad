@@ -102,6 +102,64 @@ export const tanh = unary('tanh', Math.tanh, (_x, out) => 1 - out * out);
 export const sigmoid = unary('sigmoid', (x) => 1 / (1 + Math.exp(-x)), (_x, out) => out * (1 - out));
 
 /**
+ * Elementwise maximum, broadcasting a scalar against anything.
+ *
+ * The subgradient at a tie is a convention, not a derivation: when `a === b`
+ * the whole adjoint goes to the LEFT operand, so `maximum(x, 0)` at `x = 0`
+ * reports `dx = 1`. Deterministic and cheap, and the caller landing exactly on
+ * the tie can predict which way it falls. Splitting the adjoint evenly would
+ * be defensible too, but it is not what this does.
+ *
+ * `Math.max` is the forward, so a NaN operand propagates rather than being
+ * quietly outranked. A sampler stepping outside a support needs the non-finite
+ * value to reach it.
+ *
+ * @param {Var|number|number[]|number[][]} a
+ * @param {Var|number|number[]|number[][]} b
+ * @returns {Var}
+ */
+export const maximum = binary(
+  'maximum',
+  Math.max,
+  (x, y) => (x >= y ? 1 : 0),
+  (x, y) => (x >= y ? 0 : 1),
+);
+
+/**
+ * Elementwise minimum, broadcasting a scalar against anything.
+ *
+ * Mirrors {@link maximum}: at a tie the whole adjoint goes to the LEFT operand,
+ * so `minimum(x, 0)` at `x = 0` reports `dx = 1`. A NaN operand propagates.
+ *
+ * @param {Var|number|number[]|number[][]} a
+ * @param {Var|number|number[]|number[][]} b
+ * @returns {Var}
+ */
+export const minimum = binary(
+  'minimum',
+  Math.min,
+  (x, y) => (x <= y ? 1 : 0),
+  (x, y) => (x <= y ? 0 : 1),
+);
+
+/**
+ * Rectified linear unit, `max(x, 0)`.
+ *
+ * The same thing as `maximum(x, 0)`, as a unary op: no second operand and no
+ * broadcast machinery for the case that wants neither. It is also the
+ * primitive that makes a piecewise-linear model expressible at all, a
+ * quadratic-plateau dose response being the case in hand: the join sits at a
+ * PARAMETER, so which observations fall below it changes as the optimizer or
+ * sampler moves, and no precomputed mask can stand in for the clamp.
+ *
+ * `relu'(0) = 0`, matching JAX and PyTorch. A NaN propagates.
+ *
+ * @param {Var|number|number[]|number[][]} a
+ * @returns {Var}
+ */
+export const relu = unary('relu', (x) => Math.max(x, 0), (x) => (x > 0 ? 1 : 0));
+
+/**
  * Raise elementwise to a CONSTANT power. The exponent is not differentiated —
  * for a variable exponent write `exp(mul(k, log(x)))`, which carries both
  * partials and makes the domain restriction on `x` explicit.
