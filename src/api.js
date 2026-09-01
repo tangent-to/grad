@@ -171,3 +171,68 @@ export function valueAndGradFns(f) {
     gradient: (x) => evaluate(x).gradient,
   };
 }
+
+/**
+ * Jacobian of a VECTOR-valued function: `J[i][j] = ∂f(x)ᵢ / ∂xⱼ`.
+ *
+ * Cost is one forward pass plus one reverse pass per OUTPUT — the tape is
+ * built once and seeded m times.
+ *
+ * DO NOT reach for this to supply a stiff ODE solver's ∂f/∂y. It was written
+ * for that and measured against `@tangent.to/ode`'s finite-difference
+ * Jacobian on a stiff reaction-diffusion system; it lost, and lost worse as
+ * the system grew:
+ *
+ *     n     FD      exact     steps (FD / exact)
+ *     2    15 ms    27 ms          175 / 175
+ *    10    23 ms   218 ms          171 / 171
+ *    30    60 ms  1559 ms          171 / 171
+ *
+ * The step counts are identical, which is the whole story: a Newton iteration
+ * converges to the same answer with an approximate Jacobian — the residual is
+ * still evaluated exactly — so finite-difference error costs nothing there.
+ * Meanwhile a square Jacobian is the worst case for reverse mode: n sweeps
+ * over an n-node graph, against n+1 evaluations of cheap scalar arithmetic.
+ * Forward mode, or finite differences with sparsity colouring, is the right
+ * tool for that shape.
+ *
+ * Reverse mode pays when outputs are FEW and the map to them is expensive —
+ * a delta-method standard error, the sensitivity of a handful of summaries to
+ * many inputs.
+ *
+ * @param {(x: Var) => Var} f - vector-valued function built from these ops
+ * @returns {(x: number[]) => number[][]} m × n Jacobian
+ *
+ * @example
+ * const J = jacobian((y) => stack([mul(-2, y0(y)), sub(y0(y), y1(y))]));
+ */
+export function jacobian(f) {
+  if (typeof f !== 'function') throw new Error('jacobian: expected a function');
+
+  return (x) => {
+    const leaf = variable(x, 'input');
+    const out = f(leaf);
+    if (!(out instanceof Var)) {
+      throw new Error('jacobian: the function must return a Var built from this package\'s ops');
+    }
+    if (out.shape.length > 1) {
+      throw new Error(
+        `jacobian: the function must return a scalar or a vector, got ${shapeStr(out.shape)}`,
+      );
+    }
+    const m = out.value.data.length;
+    const n = leaf.value.data.length;
+    const J = new Array(m);
+    const seed = new Float64Array(m);
+    for (let i = 0; i < m; i++) {
+      // One reverse sweep per output row, reusing the forward pass. backward()
+      // reallocates every node's gradient, so the sweeps do not contaminate
+      // each other.
+      seed.fill(0);
+      seed[i] = 1;
+      out.backward(seed);
+      J[i] = leaf.grad === null ? new Array(n).fill(0) : Array.from(leaf.grad);
+    }
+    return J;
+  };
+}

@@ -11,7 +11,7 @@
  * Forward factorizations come from @tangent.to/lina, which is scipy-validated.
  */
 
-import { cholesky as linaCholesky } from '@tangent.to/lina';
+import { cholesky as linaCholesky, solve as linaSolve } from '@tangent.to/lina';
 import { shapeStr } from './tensor.js';
 import { node, toVar } from './tape.js';
 import { diagPart, log, mul, sum, transpose } from './ops.js';
@@ -182,4 +182,100 @@ export function logdetPSD(aIn) {
 export function solvePSD(aIn, bIn) {
   const L = cholesky(aIn);
   return triangularSolve(transpose(L), triangularSolve(L, bIn, { lower: true }), { lower: false });
+}
+
+/**
+ * Solve A X = B for a GENERAL square A, via LU.
+ *
+ * `solvePSD` covers the symmetric positive-definite case more cheaply, but a
+ * structural equation model's Σ(θ) = F(I−A)⁻¹ S (I−A)⁻ᵀ Fᵀ has to invert
+ * I−A, which is a matrix of directed paths and is not symmetric. Hence this.
+ *
+ * The adjoint follows from X = A⁻¹B, so dX = −A⁻¹ dA X + A⁻¹ dB:
+ *
+ *     B̄ = A⁻ᵀ X̄,     Ā = −B̄ Xᵀ
+ *
+ * @param {import('./tape.js').Var|number[][]} aIn - square matrix (n × n)
+ * @param {import('./tape.js').Var|number[][]|number[]} bIn - (n × k) or (n)
+ * @returns {import('./tape.js').Var} solution, shaped like `b`
+ */
+export function solveGeneral(aIn, bIn) {
+  const a = toVar(aIn, 'solveGeneral matrix');
+  const b = toVar(bIn, 'solveGeneral right-hand side');
+  if (a.shape.length !== 2 || a.shape[0] !== a.shape[1]) {
+    throw new Error(`solveGeneral: needs a square matrix, got ${shapeStr(a.shape)}`);
+  }
+  const n = a.shape[0];
+  const vectorRhs = b.shape.length === 1;
+  if (!vectorRhs && b.shape.length !== 2) {
+    throw new Error(`solveGeneral: right-hand side must be a matrix or vector, got ${shapeStr(b.shape)}`);
+  }
+  if (b.shape[0] !== n) {
+    throw new Error(`solveGeneral: ${shapeStr(a.shape)} cannot be applied to ${shapeStr(b.shape)}`);
+  }
+  const k = vectorRhs ? 1 : b.shape[1];
+
+  const An = toNestedFlat(a.value.data, n, n);
+  const Bn = vectorRhs
+    ? Array.from(b.value.data)
+    : toNestedFlat(b.value.data, n, k);
+  const Xn = linaSolve(An, Bn);
+  const X = vectorRhs ? Float64Array.from(Xn) : flattenNested(Xn, n, k);
+
+  // Aᵀ is reused for both adjoint solves; factor it once per backward pass.
+  const At = toNestedFlat(transposeFlat(a.value.data, n), n, n);
+
+  return node({ data: X, shape: vectorRhs ? [n] : [n, k] }, [a, b], (gX) => {
+    const rhs = vectorRhs ? Array.from(gX) : toNestedFlat(gX, n, k);
+    const gBn = linaSolve(At, rhs);
+    const gB = vectorRhs ? Float64Array.from(gBn) : flattenNested(gBn, n, k);
+    const gA = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        let acc = 0;
+        for (let c = 0; c < k; c++) acc += gB[i * k + c] * X[j * k + c];
+        gA[i * n + j] = -acc;
+      }
+    }
+    return [gA, gB];
+  });
+}
+
+/**
+ * Inverse of a general square matrix.
+ *
+ * Prefer `solveGeneral(A, B)` over `matmul(inv(A), B)`: it is cheaper and
+ * better conditioned. This exists for the cases where the inverse itself is
+ * the quantity of interest.
+ *
+ * @param {import('./tape.js').Var|number[][]} aIn
+ * @returns {import('./tape.js').Var}
+ */
+export function inv(aIn) {
+  const a = toVar(aIn, 'inv operand');
+  if (a.shape.length !== 2 || a.shape[0] !== a.shape[1]) {
+    throw new Error(`inv: needs a square matrix, got ${shapeStr(a.shape)}`);
+  }
+  return solveGeneral(a, identityTensorVar(a.shape[0]));
+}
+
+/** Flat n*m storage to nested rows. @private */
+function toNestedFlat(data, rows, cols) {
+  const out = new Array(rows);
+  for (let i = 0; i < rows; i++) out[i] = Array.from(data.subarray(i * cols, i * cols + cols));
+  return out;
+}
+
+/** Nested rows to flat storage. @private */
+function flattenNested(A, rows, cols) {
+  const out = new Float64Array(rows * cols);
+  for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++) out[i * cols + j] = A[i][j];
+  return out;
+}
+
+/** A constant identity matrix as a tape leaf. @private */
+function identityTensorVar(n) {
+  const data = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) data[i * n + i] = 1;
+  return toVar({ data, shape: [n, n] }, 'identity');
 }

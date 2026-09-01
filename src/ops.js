@@ -344,4 +344,99 @@ export function reshape(aIn, shape) {
   return node({ data: a.value.data.slice(), shape: shape.slice() }, [a], (g) => [g.slice()]);
 }
 
+/**
+ * Extract a contiguous submatrix (or subvector) — the differentiable form of
+ * `rows.slice(...).map((r) => r.slice(...))`.
+ *
+ * A structural equation model needs it: Σ is built over latent AND observed
+ * variables, then only the observed block is compared with the data.
+ *
+ * @param {Var|number[]|number[][]} aIn
+ * @param {number[]} start - starting index per axis
+ * @param {number[]} size - extent per axis
+ * @returns {Var}
+ */
+export function slice(aIn, start, size) {
+  const a = toVar(aIn, 'slice operand');
+  const rank = a.shape.length;
+  if (rank === 0) throw new Error('slice: cannot slice a scalar');
+  if (start.length !== rank || size.length !== rank) {
+    throw new Error(`slice: start and size need ${rank} entr${rank === 1 ? 'y' : 'ies'} for a ${shapeStr(a.shape)} operand`);
+  }
+  for (let d = 0; d < rank; d++) {
+    if (!Number.isInteger(start[d]) || !Number.isInteger(size[d]) || start[d] < 0 || size[d] < 1) {
+      throw new Error('slice: start must be a non-negative integer and size a positive integer');
+    }
+    if (start[d] + size[d] > a.shape[d]) {
+      throw new Error(
+        `slice: [${start[d]}, ${start[d] + size[d]}) exceeds axis ${d} of ${shapeStr(a.shape)}`,
+      );
+    }
+  }
+
+  const src = a.value.data;
+  if (rank === 1) {
+    const [s0] = start;
+    const [n0] = size;
+    const out = src.slice(s0, s0 + n0);
+    return node({ data: out, shape: [n0] }, [a], (g) => {
+      const ga = new Float64Array(src.length);
+      for (let i = 0; i < n0; i++) ga[s0 + i] = g[i];
+      return [ga];
+    });
+  }
+  const [m, n] = a.shape;
+  const [s0, s1] = start;
+  const [m0, n0] = size;
+  const out = new Float64Array(m0 * n0);
+  for (let i = 0; i < m0; i++) {
+    for (let j = 0; j < n0; j++) out[i * n0 + j] = src[(s0 + i) * n + (s1 + j)];
+  }
+  return node({ data: out, shape: [m0, n0] }, [a], (g) => {
+    const ga = new Float64Array(m * n);
+    for (let i = 0; i < m0; i++) {
+      for (let j = 0; j < n0; j++) ga[(s0 + i) * n + (s1 + j)] = g[i * n0 + j];
+    }
+    return [ga];
+  });
+}
+
+/**
+ * Assemble scalar or vector Vars into one vector, end to end.
+ *
+ * The companion to `slice`, and what a vector-valued function needs to return:
+ * an ODE right-hand side is written component by component and concatenated.
+ *
+ * @param {Array<Var|number|number[]>} parts
+ * @returns {Var}
+ */
+export function concat(parts) {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    throw new Error('concat: needs a non-empty array of parts');
+  }
+  const vars = parts.map((p, i) => toVar(p, `concat part ${i}`));
+  for (const v of vars) {
+    if (v.shape.length > 1) {
+      throw new Error(`concat: parts must be scalars or vectors, got ${shapeStr(v.shape)}`);
+    }
+  }
+  const lengths = vars.map((v) => v.value.data.length);
+  const total = lengths.reduce((a, b) => a + b, 0);
+  const out = new Float64Array(total);
+  let off = 0;
+  for (const v of vars) {
+    out.set(v.value.data, off);
+    off += v.value.data.length;
+  }
+  return node({ data: out, shape: [total] }, vars, (g) => {
+    const contribs = [];
+    let o = 0;
+    for (const len of lengths) {
+      contribs.push(g.slice(o, o + len));
+      o += len;
+    }
+    return contribs;
+  });
+}
+
 export { zeros, sameShape };

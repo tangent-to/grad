@@ -121,11 +121,34 @@ Accuracy matters more than either. Against a hand-derived closed form, the
 autograd gradient agrees to ~1e-13; central differences are off by ~2e-7. That
 error is what breaks the symplectic property leapfrog integration relies on.
 
+## Where this pays, and where it does not
+
+Measured, not assumed.
+
+**Probabilistic models — yes.** Finite-difference gradients cost 2P likelihood
+evaluations per gradient and break the symplectic property leapfrog relies on.
+See the table above: 7.7x end to end on a 21-parameter NUTS run, same
+posterior, validated against PyMC.
+
+**Structural equation models — yes.** The ML discrepancy
+`F = log|Σ| + tr(SΣ⁻¹)` over `Σ(θ) = F(I−A)⁻¹Ψ(I−A)⁻ᵀFᵀ` is a scalar objective
+in few parameters: reverse mode's best case. `(I−A)` is not symmetric, which is
+why `solveGeneral`/`inv` exist, and only the observed block of Σ is compared
+with the data, which is why `slice` does.
+
+**Stiff ODE Jacobians — no.** Tried and measured against `@tangent.to/ode`'s
+finite-difference Jacobian on a stiff reaction-diffusion system: identical step
+counts, and up to 26x slower at n = 30. A Newton iteration converges to the
+same answer with an approximate Jacobian, so the accuracy buys nothing, and a
+square Jacobian is reverse mode's worst shape. `jacobian` is still exported and
+correct — it pays where outputs are few — but it is not the tool for that job.
+
 ## Status
 
 Early. The op set covers what the suite's models need; it is not a deep
 learning framework and does not try to be. No GPU backend: WebGPU has no `f64`,
-and the numerics here depend on double precision.
+and the numerics here depend on double precision. No forward mode, which is
+what a wide Jacobian would want.
 
 ## API
 
@@ -136,8 +159,10 @@ and the numerics here depend on double precision.
 | `add` `sub` `mul` `div` `neg` | elementwise arithmetic, scalar broadcasting |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `sum` `mean` | reductions to a scalar |
-| `matmul` `dot` `transpose` `reshape` `diagPart` `trace` `addDiag` | array manipulation |
-| `cholesky` `triangularSolve` `logdetPSD` `solvePSD` | differentiable linear algebra |
+| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation |
+| `cholesky` `triangularSolve` `logdetPSD` `solvePSD` | differentiable linear algebra, symmetric positive definite |
+| `solveGeneral` `inv` | the same for a general square matrix (LU) |
+| `jacobian(f)` | ∂f/∂x for a vector-valued f |
 
 `valueAndGrad` accepts either a plain array (what an optimizer passes) or a
 `{name: value}` map (what a probabilistic model passes), and returns the

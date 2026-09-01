@@ -19,7 +19,7 @@ export {
   add, sub, mul, div, neg,
   exp, log, sqrt, square, pow, tanh, sigmoid,
   sum, mean,
-  matmul, dot, transpose, diagPart, trace, addDiag, reshape,
+  matmul, dot, transpose, diagPart, trace, addDiag, reshape, slice, concat,
 } from './ops.js';
-export { cholesky, triangularSolve, logdetPSD, solvePSD } from './linalg.js';
-export { grad, valueAndGrad, valueAndGradFns } from './api.js';
+export { cholesky, triangularSolve, logdetPSD, solvePSD, solveGeneral, inv } from './linalg.js';
+export { grad, valueAndGrad, valueAndGradFns, jacobian } from './api.js';
