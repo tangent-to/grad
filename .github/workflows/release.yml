@@ -27,8 +27,12 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+      # Pin npm 11: trusted publishing needs >= 11.5.1, and npm 12.0.0 broke the
+      # publish step the day it became `latest` — ds hit exactly this, and every
+      # tag run after it failed where 11.x had succeeded hours earlier. Bump
+      # deliberately, not by tracking `latest`.
       - name: Upgrade npm (trusted publishing needs npm >= 11.5.1 and Node >= 22.14)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
       - name: Install dependencies
         run: npm install --no-audit --no-fund
       - name: Test
@@ -51,11 +55,52 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+      # Install npm dependencies (@tangent.to/lina) into node_modules so deno
+      # can resolve the bare npm imports in src/ when caching and publishing.
+      # JSR does not vendor them, but publish-time resolution needs them
+      # present. This workflow was copied from lina, which is dependency-free
+      # and so never needed the step; grad does.
+      - name: Install npm dependencies
+        run: npm install --no-audit --no-fund --ignore-scripts
       # Vouch for the resolved dependency graph with the supply-chain cooldown
       # disabled, so a package can be released the same day as an intra-suite
-      # dependency it was just published alongside. No-op for dependency-free
-      # leaves. Writes an (untracked) deno.lock, hence --allow-dirty below.
+      # dependency it was just published alongside. Writes an (untracked)
+      # deno.lock, hence --allow-dirty below.
       - name: Resolve dependencies (bypass cooldown for intra-suite deps)
         run: deno cache --minimum-dependency-age=0 src/index.js
-      - name: Publish
-        run: deno publish --allow-dirty
+      # Idempotent like the npm job: a Release run can half-succeed (npm
+      # published, JSR not), and re-running it must not fail on the half that
+      # already went out.
+      - name: Publish (skip if this version is already on JSR)
+        run: |
+          NAME=$(node -p 'require("./deno.json").name')
+          VER=$(node -p 'require("./deno.json").version')
+          if curl -fsS "https://jsr.io/${NAME}/${VER}_meta.json" >/dev/null 2>&1; then
+            echo "$NAME@$VER already on JSR — skipping."
+          else
+            deno publish --allow-dirty
+          fi
+
+  github-release:
+    name: Create GitHub Release
+    needs: [npm, jsr]
+    # workflow_dispatch can fire from a branch, where github.ref_name is not a
+    # version tag. Only tag pushes should produce a release entry.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # creating a release needs more than the workflow default
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # --generate-notes walks back to the previous tag
+      - name: Create the release (skip if it already exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already has a release — skipping."
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          fi
