@@ -6,14 +6,13 @@
 // %% [markdown]
 /*
 `@tangent.to/grad` differentiates a function you wrote, exactly, by recording
-the operations it performs and walking them backwards. Write a log-likelihood
-once and its gradient comes for free — no hand-derived formulas per model, and
-no finite differences.
+the operations it performs and walking them backwards. A log-likelihood written
+once yields its own gradient, with no hand-derived formula per model and no
+finite differences.
 
-Nodes on the tape are matrices and vectors, never individual numbers. That is
-the design constraint that makes it viable in JavaScript: the per-node
-bookkeeping is noise beside an O(n³) Cholesky, and ruinous beside a scalar
-multiply.
+Nodes on the tape are matrices and vectors, not individual numbers. The
+per-node bookkeeping costs a few hundred nanoseconds, which is negligible
+against an O(n³) Cholesky and prohibitive against a scalar multiply.
 */
 
 // %% [javascript]
@@ -40,7 +39,7 @@ const cholesky = __lib.cholesky;
 
 // A scalar objective of two named parameters. `valueAndGrad` returns both the
 // value and the gradient, and the gradient arrives in the shape the parameters
-// went in — here a {name: value} map.
+// went in, here a {name: value} map.
 const simple = valueAndGrad((p) => add(square(p.mu), square(p.sigma)));
 simple({ mu: 3, sigma: 4 });
 
@@ -49,8 +48,8 @@ simple({ mu: 3, sigma: 4 });
 ## A least-squares objective
 
 The gradient of a sum of squared residuals, against the closed form
-`-2 Xᵀ(y - Xβ)` that anyone would derive by hand. They agree to machine
-precision — which is the point: the tape is not an approximation.
+`-2 Xᵀ(y - Xβ)`. They agree to machine precision, because the tape computes the
+derivative rather than approximating it.
 */
 
 // %% [javascript]
@@ -72,9 +71,8 @@ const byHand = [0, 1].map((j) => -2 * X.reduce((s, row, i) => s + row[j] * resid
 /*
 ## Differentiable linear algebra
 
-This is what separates a statistics autograd from a toy one. A Gaussian
-process log marginal likelihood needs the derivative of `log|K|` and of
-`yᵀK⁻¹y` with respect to the kernel's hyperparameters:
+A Gaussian process log marginal likelihood needs the derivative of `log|K|`
+and of `yᵀK⁻¹y` with respect to the kernel's hyperparameters:
 
 $$\log p(y \mid \theta) = -\tfrac{1}{2} y^\top K^{-1} y - \tfrac{1}{2}\log|K| - \tfrac{n}{2}\log 2\pi$$
 
@@ -102,15 +100,14 @@ gp;
 
 // %% [markdown]
 /*
-Swap the kernel expression for a rational quadratic, a Matérn, a sum of
-several — the gradients follow. Nothing above needs rederiving, which is the
-whole argument for having this layer at all.
+Replacing the kernel expression with a rational quadratic, a Matérn, or a sum
+of several gives the gradients of the new kernel. Nothing above is rederived.
 
 ## Checking against finite differences
 
-The crude method this package exists to replace, kept here as a check. Agreement
-to ~1e-8 on a smooth objective is what a correct adjoint looks like; the tape is
-exact and the difference you see is the finite differencing's own error.
+Central differences, kept here as an independent check. The two agree to about
+1e-8 on this objective. The tape is exact, so the residual difference is the
+finite differencing's own error.
 */
 
 // %% [javascript]
@@ -155,9 +152,9 @@ const exact = [
 
 // %% [markdown]
 /*
-Reverse mode wants few outputs and many inputs. A square Jacobian like this one
-is its worst shape — for a stiff ODE solver, finite differences are genuinely
-the better tool, and the package's docs say so rather than leaving you to find
-out. Use this where the outputs are few: a delta-method standard error, the
-sensitivity of a handful of summaries to many inputs.
+Reverse mode suits objectives with few outputs and many inputs. A square
+Jacobian like this one is its worst case, and for a stiff ODE solver finite
+differences are the better tool. Use `jacobian` where the outputs are few: a
+delta-method standard error, or the sensitivity of a handful of summaries to
+many inputs.
 */
