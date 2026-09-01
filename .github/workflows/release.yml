@@ -104,3 +104,23 @@ jobs:
           else
             gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
           fi
+
+  refresh-site-api:
+    name: Refresh the suite site's API reference
+    needs: [npm, jsr]
+    runs-on: ubuntu-latest
+    steps:
+      # The site keeps a generated API reference per package, committed so its
+      # build never needs the package repos. A release changes that reference,
+      # so tell the site to regenerate. GITHUB_TOKEN cannot dispatch across
+      # repositories, hence a dedicated secret; without it this is a no-op and
+      # the site's weekly schedule picks the change up instead.
+      - name: Notify tangent-to/suite
+        if: ${{ secrets.SUITE_DISPATCH_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.SUITE_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/tangent-to/suite/dispatches \
+            -f event_type=api-update \
+            -F "client_payload[package]=${{ github.event.repository.name }}" \
+            -F "client_payload[tag]=${{ github.ref_name }}"
