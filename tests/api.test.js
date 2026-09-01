@@ -61,6 +61,21 @@ describe('valueAndGradFns', () => {
     expect(g).toEqual({ beta: [2, 4, 6] });
   });
 
+  it('propagates a non-finite parameter instead of throwing', () => {
+    // A sampler steps outside the support on its way to rejecting a
+    // trajectory: NUTS pushes σ past 0, reads back -Infinity, and stops the
+    // tree. Throwing there would kill the whole run instead of one proposal.
+    const { value, gradient } = valueAndGradFns((p) => log(p.sigma));
+    // The VALUE is what drives rejection: the sampler's Hamiltonian goes
+    // non-finite and the tree stops. (The gradient need not be non-finite —
+    // d/dx log(x) = 1/x is perfectly finite at x = -0.5 — so nothing is
+    // asserted about it beyond not throwing.)
+    expect(value({ sigma: -0.5 })).toBeNaN();
+    expect(value({ sigma: 0 })).toBe(-Infinity);
+    expect(() => gradient({ sigma: -0.5 })).not.toThrow();
+    expect(() => gradient({ sigma: NaN })).not.toThrow();
+  });
+
   it('carries a real likelihood term: Gaussian regression', () => {
     // The canonical mc potential, written in ops and differentiated exactly.
     const X = [-2, -1, 0, 1, 2];

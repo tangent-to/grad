@@ -92,7 +92,11 @@ export function asTensor(x, name = 'value') {
     return x;
   }
   if (typeof x === 'number') {
-    if (!Number.isFinite(x)) throw new Error(`${name} must be finite; got ${x}`);
+    // NaN and ±Infinity pass through deliberately. A sampler legitimately
+    // probes outside a parameter's support — NUTS steps past σ = 0 on its way
+    // to rejecting the trajectory — and needs the density to answer -Infinity
+    // there, not to throw. Rejecting non-finite input would also be
+    // inconsistent: the array branches below never checked.
     return { data: Float64Array.of(x), shape: [] };
   }
   if (x instanceof Float64Array) {
