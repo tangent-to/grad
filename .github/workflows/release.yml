@@ -116,10 +116,18 @@ jobs:
       # repositories, hence a dedicated secret; without it this is a no-op and
       # the site's weekly schedule picks the change up instead.
       - name: Notify tangent-to/suite
-        if: ${{ secrets.SUITE_DISPATCH_TOKEN != '' }}
         env:
           GH_TOKEN: ${{ secrets.SUITE_DISPATCH_TOKEN }}
+        # The guard lives in the shell, not in an `if:`. GitHub does not expose
+        # the `secrets` context to a step-level condition — using it there does
+        # not merely evaluate false, it makes the whole workflow file
+        # unparseable, so every release fails rather than skipping this one job.
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo 'SUITE_DISPATCH_TOKEN is not set — skipping. The site picks the'
+            echo 'change up on its weekly schedule instead.'
+            exit 0
+          fi
           gh api repos/tangent-to/suite/dispatches \
             -f event_type=api-update \
             -F "client_payload[package]=${{ github.event.repository.name }}" \
