@@ -7,6 +7,12 @@ statistical models are made of.
 Write a log-likelihood once; get its exact gradient. No hand-derived
 derivatives per model, no finite differences.
 
+The automatic-differentiation leaf of the
+[tangent suite](https://github.com/tangent-to) — MIT-licensed infrastructure
+consumed by [ds](https://github.com/tangent-to/ds) (Gaussian-process
+hyperparameters), [mc](https://github.com/tangent-to/mc) (HMC/NUTS gradients)
+and [sem](https://github.com/tangent-to/sem) (the ML discrepancy).
+
 ```js
 import { valueAndGrad, add, square } from '@tangent.to/grad';
 
