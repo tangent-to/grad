@@ -1,0 +1,61 @@
+name: Release
+
+# Triggered by pushing a version tag created with `npm version` (see RELEASING.md):
+#   npm version patch && git push --follow-tags
+# Publishes the version in package.json / deno.json to npm and JSR, each with
+# provenance. Safe to re-run: the npm job skips a version already on the registry.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm provenance attestation + JSR OIDC authentication
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Upgrade npm (trusted publishing needs npm >= 11.5.1 and Node >= 22.14)
+        run: npm install -g npm@latest
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Test
+        run: npm run test:run
+      - name: Publish (skip if this version is already on npm)
+        run: |
+          NAME=$(node -p 'require("./package.json").name')
+          VER=$(node -p 'require("./package.json").version')
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm — skipping."
+          else
+            npm publish --provenance --access public
+          fi
+
+  jsr:
+    name: Publish to JSR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      # Vouch for the resolved dependency graph with the supply-chain cooldown
+      # disabled, so a package can be released the same day as an intra-suite
+      # dependency it was just published alongside. No-op for dependency-free
+      # leaves. Writes an (untracked) deno.lock, hence --allow-dirty below.
+      - name: Resolve dependencies (bypass cooldown for intra-suite deps)
+        run: deno cache --minimum-dependency-age=0 src/index.js
+      - name: Publish
+        run: deno publish --allow-dirty

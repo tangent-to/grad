@@ -1,0 +1,58 @@
+{
+  "name": "@tangent.to/grad",
+  "version": "0.1.0",
+  "description": "Reverse-mode automatic differentiation for JavaScript (ESM): array-valued tape, linear-algebra adjoints (Cholesky, triangular solve, log-determinant). Finite-difference validated.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "browser": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepare": "npm run build:browser",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "build:browser": "esbuild src/index.js --bundle --platform=browser --format=esm --target=es2020 --outfile=dist/index.js --sourcemap --minify --keep-names --external:@tangent.to/*",
+    "jsr:publish": "deno publish --allow-dirty",
+    "jsr:publish:dry-run": "deno publish --dry-run --allow-dirty",
+    "deno:check": "deno check src/index.js",
+    "deno:lint": "deno lint src/",
+    "version": "node scripts/sync-version.mjs && git add deno.json"
+  },
+  "keywords": [
+    "autograd",
+    "automatic-differentiation",
+    "gradient",
+    "backpropagation",
+    "reverse-mode",
+    "esm",
+    "browser"
+  ],
+  "author": "Essi Parent",
+  "license": "MIT",
+  "homepage": "https://github.com/tangent-to/grad",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tangent-to/grad"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "@tangent.to/lina": "^0.1.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.11",
+    "vitest": "^1.6.0"
+  }
+}
