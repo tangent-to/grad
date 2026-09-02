@@ -184,22 +184,33 @@ function copyParams(x) {
  */
 export function valueAndGradFns(f, options = {}) {
   const vg = options.compile ? compile(f) : valueAndGrad(f);
+  const fns = splitValueAndGrad(vg);
+  if (options.compile) fns.compiled = vg;
+  return fns;
+}
+
+/**
+ * Split any `(x) => { value, gradient }` function into the separate value and
+ * gradient functions a `(fn, gradFn)` API takes, sharing one evaluation
+ * between them exactly as {@link valueAndGradFns} does. For a function that
+ * already exists, such as one rebuilt by {@link compileFromJSON}.
+ *
+ * @param {(x: any) => { value: number, gradient: any }} vg
+ * @returns {{ value: (x:any) => number, gradient: (x:any) => any }}
+ */
+export function splitValueAndGrad(vg) {
   let lastInput;
   let lastResult;
-
   const evaluate = (x) => {
     if (lastResult !== undefined && sameParams(lastInput, x)) return lastResult;
     lastResult = vg(x);
     lastInput = copyParams(x);
     return lastResult;
   };
-
-  const fns = {
+  return {
     value: (x) => evaluate(x).value,
     gradient: (x) => evaluate(x).gradient,
   };
-  if (options.compile) fns.compiled = vg;
-  return fns;
 }
 
 /**
