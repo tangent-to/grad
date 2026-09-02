@@ -1,6 +1,6 @@
 {
   "name": "@tangent.to/grad",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Reverse-mode automatic differentiation for JavaScript (ESM): array-valued tape, linear-algebra adjoints (Cholesky, triangular solve, log-determinant). Finite-difference validated.",
   "type": "module",
   "main": "./dist/index.js",
