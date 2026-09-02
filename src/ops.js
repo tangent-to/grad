@@ -33,73 +33,182 @@ function broadcastShape(a, b, op) {
   return a.shape;
 }
 
-/** Read element i of a tensor that may be a broadcast scalar. @private */
-const at = (t, i) => (t.shape.length === 0 ? t.data[0] : t.data[i]);
+/**
+ * Stride for reading an operand elementwise: 0 for a broadcast scalar, which
+ * pins every read to element 0, and 1 otherwise. Resolving the broadcast to a
+ * stride ONCE lets the kernels below be a single flat loop instead of three
+ * variants or a per-element branch.
+ * @private
+ */
+const strideOf = (v) => (v.shape.length === 0 ? 0 : 1);
 
 /**
- * Build a binary elementwise op from its value and its two partial derivatives.
+ * Build a binary elementwise op from a forward and a backward KERNEL.
+ *
+ * A kernel is a whole loop, called once per pass — not a per-element callback.
+ * That distinction is the difference between a usable tape and an unusable one.
+ * With `f` passed per element, every op instance funnels a different function
+ * through the same call site inside one shared loop body; the site goes
+ * megamorphic, the arithmetic cannot inline, and a `+` costs upwards of 100 ns
+ * instead of under one. Measured on the elementwise chain of a 340-observation
+ * regression, hoisting the dispatch out of the loop is worth more than every
+ * other optimization in this package put together.
+ *
+ * So the plumbing is shared and the arithmetic is not. Each kernel below is its
+ * own function containing its own loop, and the one indirect call left happens
+ * 38 times per gradient rather than 7496.
+ *
  * @private
  * @param {string} op - name, for error messages
- * @param {(x:number, y:number) => number} f - forward
- * @param {(x:number, y:number, out:number) => number} dfdx
- * @param {(x:number, y:number, out:number) => number} dfdy
+ * @param {(out:Float64Array, A:Float64Array, B:Float64Array, sa:number, sb:number, n:number) => void} fwd
+ * @param {(g:Float64Array, ga:Float64Array, gb:Float64Array, A:Float64Array, B:Float64Array, out:Float64Array, sa:number, sb:number, n:number) => void} bwd
  */
-function binary(op, f, dfdx, dfdy) {
+function binary(op, fwd, bwd) {
   return (aIn, bIn) => {
     const a = toVar(aIn, `${op} left operand`);
     const b = toVar(bIn, `${op} right operand`);
     const shape = broadcastShape(a, b, op);
     const n = sizeOf(shape);
+    const A = a.value.data;
+    const B = b.value.data;
+    const sa = strideOf(a);
+    const sb = strideOf(b);
     const out = new Float64Array(n);
-    for (let i = 0; i < n; i++) out[i] = f(at(a.value, i), at(b.value, i));
+    const forward = () => fwd(out, A, B, sa, sb, n);
+    forward();
 
+    // Allocated once, refilled on every reverse pass. `backward()` accumulates a
+    // node's contributions into its parents before touching the next node, so
+    // there is no window in which these could be read stale.
+    const ga = new Float64Array(n);
+    const gb = new Float64Array(n);
     return node({ data: out, shape: shape.slice() }, [a, b], (g) => {
-      const ga = new Float64Array(n);
-      const gb = new Float64Array(n);
-      for (let i = 0; i < n; i++) {
-        const x = at(a.value, i);
-        const y = at(b.value, i);
-        ga[i] = g[i] * dfdx(x, y, out[i]);
-        gb[i] = g[i] * dfdy(x, y, out[i]);
-      }
+      bwd(g, ga, gb, A, B, out, sa, sb, n);
       return [unbroadcast(ga, a.shape), unbroadcast(gb, b.shape)];
-    });
+    }, forward);
   };
 }
 
 /**
- * Build a unary elementwise op from its value and derivative.
+ * Build a unary elementwise op from a forward and a backward kernel.
+ * Same reasoning as {@link binary}: the loop is the unit, not the element.
+ *
  * @private
  * @param {string} op
- * @param {(x:number) => number} f
- * @param {(x:number, out:number) => number} df
+ * @param {(out:Float64Array, A:Float64Array, n:number) => void} fwd
+ * @param {(g:Float64Array, ga:Float64Array, A:Float64Array, out:Float64Array, n:number) => void} bwd
  */
-function unary(op, f, df) {
+function unary(op, fwd, bwd) {
   return (aIn) => {
     const a = toVar(aIn, `${op} operand`);
     const n = a.value.data.length;
+    const A = a.value.data;
     const out = new Float64Array(n);
-    for (let i = 0; i < n; i++) out[i] = f(a.value.data[i]);
+    const forward = () => fwd(out, A, n);
+    forward();
+    const ga = new Float64Array(n);
     return node({ data: out, shape: a.shape.slice() }, [a], (g) => {
-      const ga = new Float64Array(n);
-      for (let i = 0; i < n; i++) ga[i] = g[i] * df(a.value.data[i], out[i]);
+      bwd(g, ga, A, out, n);
       return [ga];
-    });
+    }, forward);
   };
 }
 
-export const add = binary('add', (x, y) => x + y, () => 1, () => 1);
-export const sub = binary('sub', (x, y) => x - y, () => 1, () => -1);
-export const mul = binary('mul', (x, y) => x * y, (_x, y) => y, (x) => x);
-export const div = binary('div', (x, y) => x / y, (_x, y) => 1 / y, (x, y) => -x / (y * y));
+/**
+ * The escape hatch: a unary op from a per-element function, for the cases where
+ * the derivative depends on something captured at construction and there is no
+ * fixed kernel to write. `pow` is the only one. Pays the megamorphic call
+ * described on {@link binary}, so do not reach for it to add a common op.
+ * @private
+ */
+function unaryFn(op, f, df) {
+  return unary(
+    op,
+    (out, A, n) => { for (let i = 0; i < n; i++) out[i] = f(A[i]); },
+    (g, ga, A, out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * df(A[i], out[i]); },
+  );
+}
 
-export const neg = unary('neg', (x) => -x, () => -1);
-export const exp = unary('exp', Math.exp, (_x, out) => out);
-export const log = unary('log', Math.log, (x) => 1 / x);
-export const sqrt = unary('sqrt', Math.sqrt, (_x, out) => 1 / (2 * out));
-export const square = unary('square', (x) => x * x, (x) => 2 * x);
-export const tanh = unary('tanh', Math.tanh, (_x, out) => 1 - out * out);
-export const sigmoid = unary('sigmoid', (x) => 1 / (1 + Math.exp(-x)), (_x, out) => out * (1 - out));
+export const add = binary(
+  'add',
+  (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = A[i * sa] + B[i * sb]; },
+  (g, ga, gb, _A, _B, _out, _sa, _sb, n) => {
+    for (let i = 0; i < n; i++) { ga[i] = g[i]; gb[i] = g[i]; }
+  },
+);
+
+export const sub = binary(
+  'sub',
+  (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = A[i * sa] - B[i * sb]; },
+  (g, ga, gb, _A, _B, _out, _sa, _sb, n) => {
+    for (let i = 0; i < n; i++) { ga[i] = g[i]; gb[i] = -g[i]; }
+  },
+);
+
+export const mul = binary(
+  'mul',
+  (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = A[i * sa] * B[i * sb]; },
+  (g, ga, gb, A, B, _out, sa, sb, n) => {
+    for (let i = 0; i < n; i++) {
+      ga[i] = g[i] * B[i * sb];
+      gb[i] = g[i] * A[i * sa];
+    }
+  },
+);
+
+export const div = binary(
+  'div',
+  (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = A[i * sa] / B[i * sb]; },
+  (g, ga, gb, A, B, _out, sa, sb, n) => {
+    for (let i = 0; i < n; i++) {
+      const y = B[i * sb];
+      ga[i] = g[i] / y;
+      gb[i] = (-g[i] * A[i * sa]) / (y * y);
+    }
+  },
+);
+
+export const neg = unary(
+  'neg',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = -A[i]; },
+  (g, ga, _A, _out, n) => { for (let i = 0; i < n; i++) ga[i] = -g[i]; },
+);
+
+export const exp = unary(
+  'exp',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = Math.exp(A[i]); },
+  (g, ga, _A, out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * out[i]; },
+);
+
+export const log = unary(
+  'log',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = Math.log(A[i]); },
+  (g, ga, A, _out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] / A[i]; },
+);
+
+export const sqrt = unary(
+  'sqrt',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = Math.sqrt(A[i]); },
+  (g, ga, _A, out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] / (2 * out[i]); },
+);
+
+export const square = unary(
+  'square',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = A[i] * A[i]; },
+  (g, ga, A, _out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * 2 * A[i]; },
+);
+
+export const tanh = unary(
+  'tanh',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = Math.tanh(A[i]); },
+  (g, ga, _A, out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * (1 - out[i] * out[i]); },
+);
+
+export const sigmoid = unary(
+  'sigmoid',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = 1 / (1 + Math.exp(-A[i])); },
+  (g, ga, _A, out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * out[i] * (1 - out[i]); },
+);
 
 /**
  * Elementwise maximum, broadcasting a scalar against anything.
@@ -120,9 +229,16 @@ export const sigmoid = unary('sigmoid', (x) => 1 / (1 + Math.exp(-x)), (_x, out)
  */
 export const maximum = binary(
   'maximum',
-  Math.max,
-  (x, y) => (x >= y ? 1 : 0),
-  (x, y) => (x >= y ? 0 : 1),
+  (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = Math.max(A[i * sa], B[i * sb]); },
+  (g, ga, gb, A, B, _out, sa, sb, n) => {
+    for (let i = 0; i < n; i++) {
+      // `>=` is false when either operand is NaN, so the adjoint follows the
+      // right operand there, matching Math.max having propagated the NaN.
+      const left = A[i * sa] >= B[i * sb] ? 1 : 0;
+      ga[i] = g[i] * left;
+      gb[i] = g[i] * (1 - left);
+    }
+  },
 );
 
 /**
@@ -137,9 +253,14 @@ export const maximum = binary(
  */
 export const minimum = binary(
   'minimum',
-  Math.min,
-  (x, y) => (x <= y ? 1 : 0),
-  (x, y) => (x <= y ? 0 : 1),
+  (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = Math.min(A[i * sa], B[i * sb]); },
+  (g, ga, gb, A, B, _out, sa, sb, n) => {
+    for (let i = 0; i < n; i++) {
+      const left = A[i * sa] <= B[i * sb] ? 1 : 0;
+      ga[i] = g[i] * left;
+      gb[i] = g[i] * (1 - left);
+    }
+  },
 );
 
 /**
@@ -157,7 +278,13 @@ export const minimum = binary(
  * @param {Var|number|number[]|number[][]} a
  * @returns {Var}
  */
-export const relu = unary('relu', (x) => Math.max(x, 0), (x) => (x > 0 ? 1 : 0));
+export const relu = unary(
+  'relu',
+  // Math.max, not `A[i] > 0 ? A[i] : 0`: the ternary answers 0 for NaN and
+  // swallows it, which is exactly the signal a sampler needs to see.
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = Math.max(A[i], 0); },
+  (g, ga, A, _out, n) => { for (let i = 0; i < n; i++) ga[i] = A[i] > 0 ? g[i] : 0; },
+);
 
 /**
  * Raise elementwise to a CONSTANT power. The exponent is not differentiated —
@@ -172,7 +299,7 @@ export function pow(aIn, k) {
   if (typeof k !== 'number' || !Number.isFinite(k)) {
     throw new Error(`pow: exponent must be a finite number; got ${k}`);
   }
-  return unary('pow', (x) => Math.pow(x, k), (x) => k * Math.pow(x, k - 1))(aIn);
+  return unaryFn('pow', (x) => Math.pow(x, k), (x) => k * Math.pow(x, k - 1))(aIn);
 }
 
 /**
@@ -183,13 +310,18 @@ export function pow(aIn, k) {
 export function sum(aIn) {
   const a = toVar(aIn, 'sum operand');
   const n = a.value.data.length;
-  let s = 0;
-  for (let i = 0; i < n; i++) s += a.value.data[i];
-  return node({ data: Float64Array.of(s), shape: [] }, [a], (g) => {
-    const ga = new Float64Array(n);
+  const out = new Float64Array(1);
+  const forward = () => {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += a.value.data[i];
+    out[0] = s;
+  };
+  forward();
+  const ga = new Float64Array(n);
+  return node({ data: out, shape: [] }, [a], (g) => {
     ga.fill(g[0]);
     return [ga];
-  });
+  }, forward);
 }
 
 /**
@@ -200,13 +332,18 @@ export function sum(aIn) {
 export function mean(aIn) {
   const a = toVar(aIn, 'mean operand');
   const n = a.value.data.length;
-  let s = 0;
-  for (let i = 0; i < n; i++) s += a.value.data[i];
-  return node({ data: Float64Array.of(s / n), shape: [] }, [a], (g) => {
-    const ga = new Float64Array(n);
+  const out = new Float64Array(1);
+  const forward = () => {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += a.value.data[i];
+    out[0] = s / n;
+  };
+  forward();
+  const ga = new Float64Array(n);
+  return node({ data: out, shape: [] }, [a], (g) => {
     ga.fill(g[0] / n);
     return [ga];
-  });
+  }, forward);
 }
 
 /**
@@ -239,19 +376,25 @@ export function matmul(aIn, bIn) {
   const A = a.value.data;
   const B = b.value.data;
   const out = new Float64Array(m * n);
-  for (let i = 0; i < m; i++) {
-    for (let p = 0; p < k; p++) {
-      const aip = A[i * k + p];
-      if (aip === 0) continue;
-      for (let j = 0; j < n; j++) out[i * n + j] += aip * B[p * n + j];
+  const forward = () => {
+    out.fill(0); // the kernel accumulates
+    for (let i = 0; i < m; i++) {
+      for (let p = 0; p < k; p++) {
+        const aip = A[i * k + p];
+        if (aip === 0) continue;
+        for (let j = 0; j < n; j++) out[i * n + j] += aip * B[p * n + j];
+      }
     }
-  }
+  };
+  forward();
 
   const shape = vectorRhs ? [m] : [m, n];
+  const ga = new Float64Array(m * k);
+  const gb = new Float64Array(k * n);
   return node({ data: out, shape }, [a, b], (g) => {
     // Ā = Ḡ Bᵀ, B̄ = Aᵀ Ḡ
-    const ga = new Float64Array(m * k);
-    const gb = new Float64Array(k * n);
+    ga.fill(0);
+    gb.fill(0);
     for (let i = 0; i < m; i++) {
       for (let j = 0; j < n; j++) {
         const gij = g[i * n + j];
@@ -263,7 +406,7 @@ export function matmul(aIn, bIn) {
       }
     }
     return [ga, gb];
-  });
+  }, forward);
 }
 
 /**
@@ -279,17 +422,22 @@ export function dot(uIn, vIn) {
     throw new Error(`dot: needs two vectors of equal length, got ${shapeStr(u.shape)} and ${shapeStr(v.shape)}`);
   }
   const n = u.shape[0];
-  let s = 0;
-  for (let i = 0; i < n; i++) s += u.value.data[i] * v.value.data[i];
-  return node({ data: Float64Array.of(s), shape: [] }, [u, v], (g) => {
-    const gu = new Float64Array(n);
-    const gv = new Float64Array(n);
+  const out = new Float64Array(1);
+  const forward = () => {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += u.value.data[i] * v.value.data[i];
+    out[0] = s;
+  };
+  forward();
+  const gu = new Float64Array(n);
+  const gv = new Float64Array(n);
+  return node({ data: out, shape: [] }, [u, v], (g) => {
     for (let i = 0; i < n; i++) {
       gu[i] = g[0] * v.value.data[i];
       gv[i] = g[0] * u.value.data[i];
     }
     return [gu, gv];
-  });
+  }, forward);
 }
 
 /**
@@ -304,12 +452,15 @@ export function transpose(aIn) {
   }
   const [m, n] = a.shape;
   const out = new Float64Array(m * n);
-  for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) out[j * m + i] = a.value.data[i * n + j];
+  const forward = () => {
+    for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) out[j * m + i] = a.value.data[i * n + j];
+  };
+  forward();
+  const ga = new Float64Array(m * n);
   return node({ data: out, shape: [n, m] }, [a], (g) => {
-    const ga = new Float64Array(m * n);
     for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) ga[i * n + j] = g[j * m + i];
     return [ga];
-  });
+  }, forward);
 }
 
 /**
@@ -324,12 +475,15 @@ export function diagPart(aIn) {
   }
   const n = a.shape[0];
   const out = new Float64Array(n);
-  for (let i = 0; i < n; i++) out[i] = a.value.data[i * n + i];
+  const forward = () => {
+    for (let i = 0; i < n; i++) out[i] = a.value.data[i * n + i];
+  };
+  forward();
+  const ga = new Float64Array(n * n);
   return node({ data: out, shape: [n] }, [a], (g) => {
-    const ga = new Float64Array(n * n);
     for (let i = 0; i < n; i++) ga[i * n + i] = g[i];
     return [ga];
-  });
+  }, forward);
 }
 
 /**
@@ -364,17 +518,24 @@ export function addDiag(aIn, alphaIn) {
   if (!perRow && alpha.shape.length !== 0) {
     throw new Error(`addDiag: diagonal must be a scalar or a vector, got ${shapeStr(alpha.shape)}`);
   }
-  const out = a.value.data.slice();
-  for (let i = 0; i < n; i++) out[i * n + i] += perRow ? alpha.value.data[i] : alpha.value.data[0];
+  const out = new Float64Array(n * n);
+  const forward = () => {
+    out.set(a.value.data);
+    for (let i = 0; i < n; i++) out[i * n + i] += perRow ? alpha.value.data[i] : alpha.value.data[0];
+  };
+  forward();
 
+  const gAlpha = new Float64Array(perRow ? n : 1);
   return node({ data: out, shape: [n, n] }, [a, alpha], (g) => {
-    const gAlpha = new Float64Array(perRow ? n : 1);
+    gAlpha.fill(0);
     for (let i = 0; i < n; i++) {
       if (perRow) gAlpha[i] = g[i * n + i];
       else gAlpha[0] += g[i * n + i];
     }
+    // g is the node's own grad buffer, which the caller keeps accumulating
+    // into; the matrix parent needs a copy, not a view of it.
     return [g.slice(), gAlpha];
-  });
+  }, forward);
 }
 
 /**
@@ -399,7 +560,10 @@ export function reshape(aIn, shape) {
       `reshape: cannot view ${a.value.data.length} elements as ${shapeStr(shape)}`,
     );
   }
-  return node({ data: a.value.data.slice(), shape: shape.slice() }, [a], (g) => [g.slice()]);
+  const out = new Float64Array(a.value.data.length);
+  const forward = () => out.set(a.value.data);
+  forward();
+  return node({ data: out, shape: shape.slice() }, [a], (g) => [g.slice()], forward);
 }
 
 /**
@@ -436,27 +600,34 @@ export function slice(aIn, start, size) {
   if (rank === 1) {
     const [s0] = start;
     const [n0] = size;
-    const out = src.slice(s0, s0 + n0);
+    const out = new Float64Array(n0);
+    const forward = () => out.set(src.subarray(s0, s0 + n0));
+    forward();
+    const ga = new Float64Array(src.length);
     return node({ data: out, shape: [n0] }, [a], (g) => {
-      const ga = new Float64Array(src.length);
+      ga.fill(0);
       for (let i = 0; i < n0; i++) ga[s0 + i] = g[i];
       return [ga];
-    });
+    }, forward);
   }
   const [m, n] = a.shape;
   const [s0, s1] = start;
   const [m0, n0] = size;
   const out = new Float64Array(m0 * n0);
-  for (let i = 0; i < m0; i++) {
-    for (let j = 0; j < n0; j++) out[i * n0 + j] = src[(s0 + i) * n + (s1 + j)];
-  }
+  const forward = () => {
+    for (let i = 0; i < m0; i++) {
+      for (let j = 0; j < n0; j++) out[i * n0 + j] = src[(s0 + i) * n + (s1 + j)];
+    }
+  };
+  forward();
+  const ga = new Float64Array(m * n);
   return node({ data: out, shape: [m0, n0] }, [a], (g) => {
-    const ga = new Float64Array(m * n);
+    ga.fill(0);
     for (let i = 0; i < m0; i++) {
       for (let j = 0; j < n0; j++) ga[(s0 + i) * n + (s1 + j)] = g[i * n0 + j];
     }
     return [ga];
-  });
+  }, forward);
 }
 
 /**
@@ -481,11 +652,14 @@ export function concat(parts) {
   const lengths = vars.map((v) => v.value.data.length);
   const total = lengths.reduce((a, b) => a + b, 0);
   const out = new Float64Array(total);
-  let off = 0;
-  for (const v of vars) {
-    out.set(v.value.data, off);
-    off += v.value.data.length;
-  }
+  const forward = () => {
+    let off = 0;
+    for (const v of vars) {
+      out.set(v.value.data, off);
+      off += v.value.data.length;
+    }
+  };
+  forward();
   return node({ data: out, shape: [total] }, vars, (g) => {
     const contribs = [];
     let o = 0;
@@ -494,7 +668,7 @@ export function concat(parts) {
       o += len;
     }
     return contribs;
-  });
+  }, forward);
 }
 
 export { zeros, sameShape };

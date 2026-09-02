@@ -76,11 +76,15 @@ export function cholesky(aIn) {
   // lina's public entry takes nested rows. Its flat kernel would save the round
   // trip, but is not exported; the conversion is a few percent of an O(n³)
   // factorization, and the validated forward is worth more than that.
-  const nested = new Array(n);
-  for (let i = 0; i < n; i++) nested[i] = Array.from(a.value.data.subarray(i * n, i * n + n));
-  const Lnested = linaCholesky(nested);
   const L = new Float64Array(n * n);
-  for (let i = 0; i < n; i++) for (let j = 0; j <= i; j++) L[i * n + j] = Lnested[i][j];
+  const forward = () => {
+    const nested = new Array(n);
+    for (let i = 0; i < n; i++) nested[i] = Array.from(a.value.data.subarray(i * n, i * n + n));
+    const Lnested = linaCholesky(nested);
+    L.fill(0); // the upper triangle stays zero, and a replay must not inherit it
+    for (let i = 0; i < n; i++) for (let j = 0; j <= i; j++) L[i * n + j] = Lnested[i][j];
+  };
+  forward();
 
   return node({ data: L, shape: [n, n] }, [a], (gL) => {
     // P = Φ(Lᵀ L̄): lower triangle of LᵀL̄, diagonal halved.
@@ -105,7 +109,7 @@ export function cholesky(aIn) {
       }
     }
     return [gA];
-  });
+  }, forward);
 }
 
 /**
@@ -136,7 +140,11 @@ export function triangularSolve(tIn, bIn, opts = {}) {
   }
   const k = vectorRhs ? 1 : b.shape[1];
   const T = t.value.data;
-  const X = lower ? lowerSolve(T, b.value.data, n, k) : upperSolve(T, b.value.data, n, k);
+  const X = new Float64Array(n * k);
+  const forward = () => {
+    X.set(lower ? lowerSolve(T, b.value.data, n, k) : upperSolve(T, b.value.data, n, k));
+  };
+  forward();
 
   return node({ data: X, shape: vectorRhs ? [n] : [n, k] }, [t, b], (gX) => {
     // With X = T⁻¹B:  B̄ = T⁻ᵀ X̄  and  T̄ = −B̄ Xᵀ, kept to T's own triangle.
@@ -153,7 +161,7 @@ export function triangularSolve(tIn, bIn, opts = {}) {
       }
     }
     return [gT, gB];
-  });
+  }, forward);
 }
 
 /**
@@ -215,15 +223,21 @@ export function solveGeneral(aIn, bIn) {
   }
   const k = vectorRhs ? 1 : b.shape[1];
 
-  const An = toNestedFlat(a.value.data, n, n);
-  const Bn = vectorRhs
-    ? Array.from(b.value.data)
-    : toNestedFlat(b.value.data, n, k);
-  const Xn = linaSolve(An, Bn);
-  const X = vectorRhs ? Float64Array.from(Xn) : flattenNested(Xn, n, k);
-
-  // Aᵀ is reused for both adjoint solves; factor it once per backward pass.
-  const At = toNestedFlat(transposeFlat(a.value.data, n), n, n);
+  const X = new Float64Array(n * k);
+  // Aᵀ feeds both adjoint solves. It is derived from the forward values, so a
+  // replay has to refresh it here — leaving it captured from the build call
+  // would give a correct-looking gradient computed at the wrong A.
+  let At;
+  const forward = () => {
+    const An = toNestedFlat(a.value.data, n, n);
+    const Bn = vectorRhs
+      ? Array.from(b.value.data)
+      : toNestedFlat(b.value.data, n, k);
+    const Xn = linaSolve(An, Bn);
+    X.set(vectorRhs ? Float64Array.from(Xn) : flattenNested(Xn, n, k));
+    At = toNestedFlat(transposeFlat(a.value.data, n), n, n);
+  };
+  forward();
 
   return node({ data: X, shape: vectorRhs ? [n] : [n, k] }, [a, b], (gX) => {
     const rhs = vectorRhs ? Array.from(gX) : toNestedFlat(gX, n, k);
@@ -238,7 +252,7 @@ export function solveGeneral(aIn, bIn) {
       }
     }
     return [gA, gB];
-  });
+  }, forward);
 }
 
 /**

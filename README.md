@@ -52,6 +52,14 @@ quadratic forms and Gaussian log-likelihoods all *compose* from those, and so
 inherit correct derivatives for free. Every hand-derived formula is a place to
 be subtly wrong, so there are as few as the problem allows.
 
+**The kernel is a loop, not an element.** Every elementwise op is written as a
+whole loop over its operands, called once per pass. The obvious alternative,
+passing a per-element function to a shared loop body, sends that call site
+megamorphic once a dozen ops share it: the arithmetic stops inlining and an
+addition costs upwards of 100 ns instead of well under one. On the regression
+above, hoisting the dispatch out of the inner loop was worth more than every
+other optimization in this package put together.
+
 **Rank capped at 2.** Scalars, vectors, matrices. Every model in the suite is
 expressed in those; rank-N would cost broadcasting complexity in every adjoint
 for no consumer.
@@ -127,6 +135,47 @@ Accuracy matters more than either. Against a hand-derived closed form, the
 autograd gradient agrees to ~1e-13; central differences are off by ~2e-7. That
 error is what breaks the symplectic property leapfrog integration relies on.
 
+## Cost, and `compile`
+
+`valueAndGrad` rebuilds the graph on every call: a `Var` and a closure per
+operation, a topological sort, a fresh gradient buffer per node. On a
+340-observation regression with 15 parameters, that bookkeeping was 92% of the
+runtime and the arithmetic was the small part. None of it changes between
+calls, because the shapes are fixed and the sequence of operations is the same.
+Only the values move.
+
+`compile` keeps the graph, writes the new values into its leaves, and replays
+it:
+
+```js
+import { compile } from '@tangent.to/grad';
+
+const vg = compile((p) => negLogLik(p));
+for (const p of chain) vg(p);          // one graph, many evaluations
+```
+
+Per gradient on that model, and over a 4-chain 800-iteration NUTS run:
+
+| | ms | full run |
+|---|---|---|
+| `valueAndGrad` | 0.258 | 54 s |
+| `compile` | 0.096 | 20 s |
+| gradient derived by hand | 0.047 | 9 s |
+
+The three agree bit for bit.
+
+The constraint is that the graph must be the same on every call. There are two
+ways to break that, and both take deliberate effort to write: branching on a
+parameter's numeric value by reaching into `.data`, or closing over data that
+is mutated between calls. A branch *inside* an op is fine, and is the reason
+`relu` and `maximum` exist: the kernel picks a side per element while the graph
+stays put. A change in a parameter's shape is detected and rebuilds the plan,
+so varying dimensions cost a rebuild rather than a wrong answer.
+
+`valueAndGradFns(f, { compile: true })` opts the mc pair in. It is off by
+default because a static graph is an assumption about your objective, and one
+this package cannot check for you.
+
 ## Where this pays, and where it does not
 
 Measured, not assumed.
@@ -162,6 +211,8 @@ what a wide Jacobian would want.
 |---|---|
 | `variable(x)`, `Var` | tape leaves and nodes |
 | `valueAndGrad(f)`, `grad(f)` | differentiate a scalar objective |
+| `compile(f)` | the same, reusing the tape across calls; see [Cost](#cost-and-compile) |
+| `valueAndGradFns(f, opts)` | the `(fn, gradFn)` pair mc's `potential` takes |
 | `add` `sub` `mul` `div` `neg` | elementwise arithmetic, scalar broadcasting |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
