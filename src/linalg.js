@@ -109,7 +109,7 @@ export function cholesky(aIn) {
       }
     }
     return [gA];
-  }, forward);
+  }, forward, { op: 'cholesky' });
 }
 
 /**
@@ -161,7 +161,7 @@ export function triangularSolve(tIn, bIn, opts = {}) {
       }
     }
     return [gT, gB];
-  }, forward);
+  }, forward, { op: 'triangularSolve', args: [{ lower }] });
 }
 
 /**
@@ -252,7 +252,7 @@ export function solveGeneral(aIn, bIn) {
       }
     }
     return [gA, gB];
-  }, forward);
+  }, forward, { op: 'solveGeneral' });
 }
 
 /**

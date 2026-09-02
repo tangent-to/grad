@@ -14,7 +14,18 @@
  */
 
 import { Var, topoOrder, variable } from './tape.js';
-import { shapeStr, toNested } from './tensor.js';
+import { shapeStr, sizeOf, toNested } from './tensor.js';
+import * as ops from './ops.js';
+import * as linalg from './linalg.js';
+
+/**
+ * Every op a serialized plan may name, keyed by its exported name. A node's
+ * `spec.op` is looked up here when a plan is rebuilt.
+ * @private
+ */
+const REGISTRY = Object.fromEntries(
+  Object.entries({ ...ops, ...linalg }).filter(([, v]) => typeof v === 'function'),
+);
 
 /** Is this a `{name: value}` parameter map rather than a single value? @private */
 function isParamMap(x) {
@@ -400,7 +411,7 @@ export function compile(f) {
   let plan;
   let refused = false;
 
-  return (x) => {
+  const compiled = (x) => {
     if (refused) return fallback(x);
     if (plan === undefined || plan.signature !== signatureOf(x)) {
       plan = buildPlan(f, x);
@@ -411,6 +422,135 @@ export function compile(f) {
         refused = true;
         return fallback(x);
       }
+    }
+    return runPlan(plan, x);
+  };
+
+  /**
+   * The graph as data: every node's op and static arguments, every constant's
+   * values, every parameter's name and shape. See {@link compileFromJSON}.
+   * The graph exists only after a first call, since its shapes come from the
+   * input.
+   */
+  compiled.toJSON = () => {
+    if (refused) {
+      throw new Error(
+        'toJSON: this objective holds a node built outside this package\'s ops, ' +
+          'which cannot be replayed or serialized.',
+      );
+    }
+    if (plan === undefined) {
+      throw new Error('toJSON: call the compiled function once first, so the graph is built.');
+    }
+    return serializePlan(plan);
+  };
+  return compiled;
+}
+
+/** Shape → the signature fragment `signatureOf` would produce for it. @private */
+function shapeSig(shape) {
+  if (shape.length === 0) return 's';
+  if (shape.length === 1) return `v${shape[0]}`;
+  return `${shape[0]}x${shape[1]}`;
+}
+
+/** @private */
+function serializePlan(plan) {
+  const { isMap, leaves, root, order } = plan;
+  const index = new Map();
+  const nodes = [];
+  const push = (nd, entry) => {
+    index.set(nd, nodes.length);
+    nodes.push(entry);
+  };
+  // Parameters first, whether or not the objective reads them: a parameter
+  // the graph never touches still needs a zero gradient reported under its
+  // name, so it must survive the round trip.
+  if (isMap) {
+    for (const [name, v] of Object.entries(leaves)) push(v, { kind: 'param', name, shape: v.shape.slice() });
+  } else {
+    push(leaves, { kind: 'param', shape: leaves.shape.slice() });
+  }
+  for (const nd of order) {
+    if (index.has(nd)) continue;
+    if (nd.parents.length === 0) {
+      push(nd, { kind: 'const', shape: nd.shape.slice(), data: Array.from(nd.value.data) });
+      continue;
+    }
+    const entry = { kind: 'op', op: nd.spec.op, parents: nd.parents.map((p) => index.get(p)) };
+    if (nd.spec.args) entry.args = nd.spec.args;
+    if (nd.spec.list) entry.list = true;
+    push(nd, entry);
+  }
+  return { version: 1, input: isMap ? 'map' : 'single', nodes, root: index.get(root) };
+}
+
+/**
+ * Rebuild a compiled objective from the data {@link compile}'s `toJSON`
+ * produced, on this thread or another.
+ *
+ * What comes back behaves like the output of `compile`, with one difference:
+ * it has no objective function to fall back to, so it evaluates only at the
+ * shapes it was built for and throws on any other. That is the point. A
+ * worker cannot receive a closure, but it can receive this, and the data the
+ * closure captured travels inside it as constant leaves.
+ *
+ * @param {Object} json - the value `compiled.toJSON()` returned
+ * @returns {(x: any) => { value: number, gradient: any }}
+ *
+ * @example
+ * const vg = compile(negLogLik);
+ * vg(p0);                                   // builds the graph
+ * const json = vg.toJSON();                 // structured-clonable
+ * const again = compileFromJSON(json);      // in a worker, say
+ * again(p1);                                // same gradient the original gives
+ */
+export function compileFromJSON(json) {
+  if (!json || json.version !== 1 || !Array.isArray(json.nodes)) {
+    throw new Error('compileFromJSON: not a serialized plan');
+  }
+  const isMap = json.input === 'map';
+  const vars = new Array(json.nodes.length);
+  const leaves = isMap ? {} : null;
+  let single = null;
+  const sigParts = [];
+
+  json.nodes.forEach((n, i) => {
+    if (n.kind === 'param') {
+      const v = variable({ data: new Float64Array(sizeOf(n.shape)), shape: n.shape.slice() });
+      vars[i] = v;
+      if (isMap) {
+        leaves[n.name] = v;
+        sigParts.push([n.name, shapeSig(n.shape)]);
+      } else {
+        single = v;
+        sigParts.push(['', shapeSig(n.shape)]);
+      }
+    } else if (n.kind === 'const') {
+      vars[i] = variable({ data: Float64Array.from(n.data), shape: n.shape.slice() });
+    } else {
+      const fn = REGISTRY[n.op];
+      if (!fn) throw new Error(`compileFromJSON: unknown op "${n.op}"`);
+      const parents = n.parents.map((p) => vars[p]);
+      vars[i] = n.list ? fn(parents, ...(n.args ?? [])) : fn(...parents, ...(n.args ?? []));
+    }
+  });
+
+  const root = vars[json.root];
+  const order = topoOrder(root);
+  for (const nd of order) nd.grad = new Float64Array(nd.value.data.length);
+  const signature = isMap
+    ? sigParts.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, v]) => `${k}:${v}`).join(',')
+    : sigParts[0][1];
+  const plan = { isMap, leaves: isMap ? leaves : single, root, order, signature };
+
+  return (x) => {
+    const got = signatureOf(x);
+    if (got !== signature) {
+      throw new Error(
+        `compileFromJSON: this plan was built for parameters shaped ${signature}, ` +
+          `got ${got}. A rebuilt plan has no objective to re-trace, so it cannot adapt.`,
+      );
     }
     return runPlan(plan, x);
   };

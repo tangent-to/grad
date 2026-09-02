@@ -22,4 +22,4 @@ export {
   matmul, dot, transpose, diagPart, trace, addDiag, reshape, slice, concat,
 } from './ops.js';
 export { cholesky, triangularSolve, logdetPSD, solvePSD, solveGeneral, inv } from './linalg.js';
-export { grad, valueAndGrad, valueAndGradFns, compile, jacobian } from './api.js';
+export { grad, valueAndGrad, valueAndGradFns, compile, compileFromJSON, jacobian } from './api.js';

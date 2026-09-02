@@ -184,6 +184,26 @@ so varying dimensions cost a rebuild rather than a wrong answer.
 default because a static graph is an assumption about your objective, and one
 this package cannot check for you.
 
+### The plan as data
+
+Once built, a compiled graph is a static structure: an ordered list of ops,
+constants holding whatever the objective captured, parameters by name. Nothing
+in it is a closure, so it can be written out and rebuilt somewhere the closure
+could never go, a worker thread being the case that matters.
+
+```js
+const vg = compile(negLogLik);
+vg(p0);                                   // builds the graph at these shapes
+const json = vg.toJSON();                 // plain data, structured-clonable
+const again = compileFromJSON(json);      // in a worker, say
+again(p1);                                // bit-identical to vg(p1)
+```
+
+A rebuilt plan has no objective to re-trace, so it evaluates only at the
+shapes it was built for and throws on any other. Every op records its exported
+name and its static arguments for this; a `Var` built by hand outside the
+package's ops cannot be serialized and `toJSON` says so.
+
 ## Where this pays, and where it does not
 
 Measured, not assumed.
@@ -219,7 +239,8 @@ what a wide Jacobian would want.
 |---|---|
 | `variable(x)`, `Var` | tape leaves and nodes |
 | `valueAndGrad(f)`, `grad(f)` | differentiate a scalar objective |
-| `compile(f)` | the same, reusing the tape across calls; see [Cost](#cost-and-compile) |
+| `compile(f)` | the same, reusing the tape across calls; see [Cost](#cost-and-compile). `.toJSON()` writes the graph out as data |
+| `compileFromJSON(json)` | rebuild a compiled objective from that data, on any thread |
 | `valueAndGradFns(f, opts)` | the `(fn, gradFn)` pair mc's `potential` takes |
 | `add` `mul` | elementwise, scalar broadcasting, and variadic: `add(a, b, c, d)` |
 | `sub` `div` `neg` | the same, strictly binary |

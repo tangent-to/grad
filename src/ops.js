@@ -95,7 +95,7 @@ function binary(op, fwd, bwd) {
     return node({ data: out, shape: shape.slice() }, [a, b], (g) => {
       bwd(g, ga, gb, A, B, out, sa, sb, n);
       return [unbroadcast(ga, a.shape), unbroadcast(gb, b.shape)];
-    }, forward);
+    }, forward, { op });
   };
 }
 
@@ -108,7 +108,7 @@ function binary(op, fwd, bwd) {
  * @param {(out:Float64Array, A:Float64Array, n:number) => void} fwd
  * @param {(g:Float64Array, ga:Float64Array, A:Float64Array, out:Float64Array, n:number) => void} bwd
  */
-function unary(op, fwd, bwd) {
+function unary(op, fwd, bwd, args = undefined) {
   return (aIn, ...rest) => {
     if (rest.length > 0) {
       throw new Error(`${op}: takes exactly one operand, got ${1 + rest.length}`);
@@ -123,7 +123,7 @@ function unary(op, fwd, bwd) {
     return node({ data: out, shape: a.shape.slice() }, [a], (g) => {
       bwd(g, ga, A, out, n);
       return [ga];
-    }, forward);
+    }, forward, args === undefined ? { op } : { op, args });
   };
 }
 
@@ -134,11 +134,12 @@ function unary(op, fwd, bwd) {
  * described on {@link binary}, so do not reach for it to add a common op.
  * @private
  */
-function unaryFn(op, f, df) {
+function unaryFn(op, f, df, args) {
   return unary(
     op,
     (out, A, n) => { for (let i = 0; i < n; i++) out[i] = f(A[i]); },
     (g, ga, A, out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * df(A[i], out[i]); },
+    args,
   );
 }
 
@@ -360,7 +361,7 @@ export function pow(aIn, k) {
   if (typeof k !== 'number' || !Number.isFinite(k)) {
     throw new Error(`pow: exponent must be a finite number; got ${k}`);
   }
-  return unaryFn('pow', (x) => Math.pow(x, k), (x) => k * Math.pow(x, k - 1))(aIn);
+  return unaryFn('pow', (x) => Math.pow(x, k), (x) => k * Math.pow(x, k - 1), [k])(aIn);
 }
 
 /**
@@ -382,7 +383,7 @@ export function sum(aIn) {
   return node({ data: out, shape: [] }, [a], (g) => {
     ga.fill(g[0]);
     return [ga];
-  }, forward);
+  }, forward, { op: 'sum' });
 }
 
 /**
@@ -404,7 +405,7 @@ export function mean(aIn) {
   return node({ data: out, shape: [] }, [a], (g) => {
     ga.fill(g[0] / n);
     return [ga];
-  }, forward);
+  }, forward, { op: 'mean' });
 }
 
 /**
@@ -467,7 +468,7 @@ export function matmul(aIn, bIn) {
       }
     }
     return [ga, gb];
-  }, forward);
+  }, forward, { op: 'matmul' });
 }
 
 /**
@@ -498,7 +499,7 @@ export function dot(uIn, vIn) {
       gv[i] = g[0] * u.value.data[i];
     }
     return [gu, gv];
-  }, forward);
+  }, forward, { op: 'dot' });
 }
 
 /**
@@ -521,7 +522,7 @@ export function transpose(aIn) {
   return node({ data: out, shape: [n, m] }, [a], (g) => {
     for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) ga[i * n + j] = g[j * m + i];
     return [ga];
-  }, forward);
+  }, forward, { op: 'transpose' });
 }
 
 /**
@@ -544,7 +545,7 @@ export function diagPart(aIn) {
   return node({ data: out, shape: [n] }, [a], (g) => {
     for (let i = 0; i < n; i++) ga[i * n + i] = g[i];
     return [ga];
-  }, forward);
+  }, forward, { op: 'diagPart' });
 }
 
 /**
@@ -596,7 +597,7 @@ export function addDiag(aIn, alphaIn) {
     // g is the node's own grad buffer, which the caller keeps accumulating
     // into; the matrix parent needs a copy, not a view of it.
     return [g.slice(), gAlpha];
-  }, forward);
+  }, forward, { op: 'addDiag' });
 }
 
 /**
@@ -624,7 +625,7 @@ export function reshape(aIn, shape) {
   const out = new Float64Array(a.value.data.length);
   const forward = () => out.set(a.value.data);
   forward();
-  return node({ data: out, shape: shape.slice() }, [a], (g) => [g.slice()], forward);
+  return node({ data: out, shape: shape.slice() }, [a], (g) => [g.slice()], forward, { op: 'reshape', args: [shape.slice()] });
 }
 
 /**
@@ -669,7 +670,7 @@ export function slice(aIn, start, size) {
       ga.fill(0);
       for (let i = 0; i < n0; i++) ga[s0 + i] = g[i];
       return [ga];
-    }, forward);
+    }, forward, { op: 'slice', args: [start.slice(), size.slice()] });
   }
   const [m, n] = a.shape;
   const [s0, s1] = start;
@@ -688,7 +689,7 @@ export function slice(aIn, start, size) {
       for (let j = 0; j < n0; j++) ga[(s0 + i) * n + (s1 + j)] = g[i * n0 + j];
     }
     return [ga];
-  }, forward);
+  }, forward, { op: 'slice', args: [start.slice(), size.slice()] });
 }
 
 /**
@@ -729,7 +730,7 @@ export function concat(parts) {
       o += len;
     }
     return contribs;
-  }, forward);
+  }, forward, { op: 'concat', list: true });
 }
 
 export { zeros, sameShape };

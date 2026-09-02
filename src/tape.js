@@ -28,11 +28,18 @@ export class Var {
    *   absent on leaves. `compile()` replays a graph through these; see the
    *   in-place invariant documented on {@link node}.
    */
-  constructor(value, parents = [], backward = null, recompute = null) {
+  constructor(value, parents = [], backward = null, recompute = null, spec = null) {
     this.value = value;
     this.parents = parents;
     this._backward = backward;
     this._recompute = recompute;
+    /**
+     * How to rebuild this node from its parents: the op's exported name and
+     * its static (non-Var) arguments. What lets a compiled plan be written
+     * out as data and rebuilt elsewhere. Null on a leaf.
+     * @type {{op: string, args?: any[], list?: boolean}|null}
+     */
+    this.spec = spec;
     /** @type {Float64Array|null} Accumulated gradient, filled by backward(). */
     this.grad = null;
   }
@@ -152,13 +159,15 @@ export function variable(x, name = 'value') {
  * @param {Var[]} parents
  * @param {(g: Float64Array) => Array<Float64Array|null>} backward
  * @param {() => void} [recompute]
+ * @param {{op: string, args?: any[], list?: boolean}} [spec] - the op's exported
+ *   name and static arguments, so a plan can be serialized and rebuilt.
  * @returns {Var}
  */
-export function node(value, parents, backward, recompute = null) {
+export function node(value, parents, backward, recompute = null, spec = null) {
   if (value.data.length !== sizeOf(value.shape)) {
     throw new Error(`op produced ${value.data.length} elements for shape ${shapeStr(value.shape)}`);
   }
-  return new Var(value, parents, backward, recompute);
+  return new Var(value, parents, backward, recompute, spec);
 }
 
 /**
