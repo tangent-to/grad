@@ -173,7 +173,10 @@ function copyParams(x) {
  *   this thousands of times at the same shapes; read `compile`'s constraint
  *   before turning it on. Off by default: a static graph is an assumption about
  *   your objective, and one this package cannot check for you.
- * @returns {{ value: (x:any) => number, gradient: (x:any) => any }}
+ * @returns {{ value: (x:any) => number, gradient: (x:any) => any, compiled?: Function }}
+ *   With `compile: true`, `compiled` is the underlying {@link compile} closure,
+ *   so its `toJSON()` is reachable: what lets a model send its likelihood to a
+ *   worker as data.
  *
  * @example
  * const { value, gradient } = valueAndGradFns((p) => logLik(p), { compile: true });
@@ -191,10 +194,12 @@ export function valueAndGradFns(f, options = {}) {
     return lastResult;
   };
 
-  return {
+  const fns = {
     value: (x) => evaluate(x).value,
     gradient: (x) => evaluate(x).gradient,
   };
+  if (options.compile) fns.compiled = vg;
+  return fns;
 }
 
 /**
