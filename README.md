@@ -60,6 +60,14 @@ addition costs upwards of 100 ns instead of well under one. On the regression
 above, hoisting the dispatch out of the inner loop was worth more than every
 other optimization in this package put together.
 
+**No operator overloading, so `add` takes every term at once.** JavaScript
+cannot define `+` on an object, which is how PyMC writes a model mean as
+`mu0 + tau * z + gamma`. Nothing here can recover that. What a binary op does
+add on top of the language's limit is nesting, and that part is avoidable:
+`add` and `mul` take any number of operands and fold left, so a five-term mean
+is one call rather than four wrapped ones. The graph is identical either way.
+`sub` and `div` stay binary, since `sub(a, b, c)` reads ambiguously.
+
 **Rank capped at 2.** Scalars, vectors, matrices. Every model in the suite is
 expressed in those; rank-N would cost broadcasting complexity in every adjoint
 for no consumer.
@@ -213,7 +221,8 @@ what a wide Jacobian would want.
 | `valueAndGrad(f)`, `grad(f)` | differentiate a scalar objective |
 | `compile(f)` | the same, reusing the tape across calls; see [Cost](#cost-and-compile) |
 | `valueAndGradFns(f, opts)` | the `(fn, gradFn)` pair mc's `potential` takes |
-| `add` `sub` `mul` `div` `neg` | elementwise arithmetic, scalar broadcasting |
+| `add` `mul` | elementwise, scalar broadcasting, and variadic: `add(a, b, c, d)` |
+| `sub` `div` `neg` | the same, strictly binary |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
 | `sum` `mean` | reductions to a scalar |

@@ -260,3 +260,76 @@ describe('valueAndGrad', () => {
     expect(() => valueAndGrad(() => 42)([1, 2])).toThrow(/must return a Var/);
   });
 });
+
+describe('variadic add and mul', () => {
+  // JavaScript cannot overload `+`, so a long sum has to be a call. Making the
+  // call take every term at once is the part that IS available, and it has to
+  // be exactly the nested form it replaces: same value, same gradient, same
+  // graph.
+  const P = { a: 1.3, b: -0.7, c: 2.9, d: 0.45 };
+
+  it('add(a, b, c, d) equals the left-nested form', () => {
+    const flat = valueAndGrad((p) => add(p.a, p.b, p.c, p.d))(P);
+    const nested = valueAndGrad((p) => add(add(add(p.a, p.b), p.c), p.d))(P);
+    expect(flat.value).toBe(nested.value);
+    expect(flat.gradient).toEqual(nested.gradient);
+  });
+
+  it('mul(a, b, c, d) equals the left-nested form', () => {
+    const flat = valueAndGrad((p) => mul(p.a, p.b, p.c, p.d))(P);
+    const nested = valueAndGrad((p) => mul(mul(mul(p.a, p.b), p.c), p.d))(P);
+    expect(flat.value).toBeCloseTo(nested.value, 14);
+    for (const k of Object.keys(P)) {
+      expect(flat.gradient[k]).toBeCloseTo(nested.gradient[k], 12);
+    }
+  });
+
+  it('still broadcasts a scalar across the terms', () => {
+    const { value, gradient } = valueAndGrad(
+      (p) => sum(add(p.k, [1, 2, 3], mul(p.k, [10, 10, 10]))),
+    )({ k: 2 });
+    // (2+1+20) + (2+2+20) + (2+3+20) = 72; d/dk = 3·(1 + 10) = 33.
+    expect(value).toBe(72);
+    expect(gradient.k).toBe(33);
+  });
+
+  it('mixes shapes the way the nested form did', () => {
+    // A vector, a scalar Var and a raw array in one call: each pair broadcasts
+    // as it folds, which is the property that makes the flat form a drop-in.
+    const { value, gradient } = valueAndGrad(
+      (p) => sum(add(p.v, p.s, [0.5, 0.5, 0.5])),
+    )({ v: [1, 2, 3], s: 4 });
+    expect(value).toBe(1 + 2 + 3 + 12 + 1.5);
+    expect(gradient.v).toEqual([1, 1, 1]);
+    expect(gradient.s).toBe(3);
+  });
+
+  it('rejects fewer than two operands, rather than quietly passing one through', () => {
+    expect(() => add(1)).toThrow(/needs at least two operands/);
+    expect(() => mul()).toThrow(/needs at least two operands/);
+  });
+
+  it('takes the two-operand form unchanged', () => {
+    expect(add(2, 3).data[0]).toBe(5);
+    expect(mul(2, 3).data[0]).toBe(6);
+  });
+
+  it('a variadic sum over MIXED shapes keeps every term', () => {
+    // The scalar cases above would still pass if the fold silently stopped
+    // after two operands, as long as it stopped consistently. This one would
+    // not: dropping the tail leaves a vector short of two whole terms.
+    const v = [1, 2, 3];
+    expect(Array.from(add(0.5, v, v, v).data)).toEqual([3.5, 6.5, 9.5]);
+    expect(Array.from(mul(2, v, v).data)).toEqual([2, 8, 18]);
+  });
+
+  it('a strictly binary op refuses a third operand instead of dropping it', () => {
+    // Before add and mul were variadic, every binary op accepted extra
+    // arguments and ignored them: sub(a, b, c) returned a - b. A wrong number
+    // with no error is worse than a failure, and the habit of reaching for a
+    // third operand is exactly what the variadic pair encourages.
+    expect(() => sub(1, 2, 3)).toThrow(/takes exactly two operands, got 3/);
+    expect(() => div(1, 2, 3)).toThrow(/takes exactly two operands/);
+    expect(() => exp(1, 2)).toThrow(/takes exactly one operand, got 2/);
+  });
+});

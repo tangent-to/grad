@@ -64,7 +64,17 @@ const strideOf = (v) => (v.shape.length === 0 ? 0 : 1);
  * @param {(g:Float64Array, ga:Float64Array, gb:Float64Array, A:Float64Array, B:Float64Array, out:Float64Array, sa:number, sb:number, n:number) => void} bwd
  */
 function binary(op, fwd, bwd) {
-  return (aIn, bIn) => {
+  return (aIn, bIn, ...rest) => {
+    // A binary op handed three operands used to compute the first two and drop
+    // the rest, with no error and no clue: `sub(a, b, c)` quietly returned
+    // `a - b`. That is a wrong number rather than a failure, which is the worst
+    // shape a mistake can take here, so it is refused.
+    if (rest.length > 0) {
+      throw new Error(
+        `${op}: takes exactly two operands, got ${2 + rest.length}. ` +
+          'add and mul are the variadic ones.',
+      );
+    }
     const a = toVar(aIn, `${op} left operand`);
     const b = toVar(bIn, `${op} right operand`);
     const shape = broadcastShape(a, b, op);
@@ -99,7 +109,10 @@ function binary(op, fwd, bwd) {
  * @param {(g:Float64Array, ga:Float64Array, A:Float64Array, out:Float64Array, n:number) => void} bwd
  */
 function unary(op, fwd, bwd) {
-  return (aIn) => {
+  return (aIn, ...rest) => {
+    if (rest.length > 0) {
+      throw new Error(`${op}: takes exactly one operand, got ${1 + rest.length}`);
+    }
     const a = toVar(aIn, `${op} operand`);
     const n = a.value.data.length;
     const A = a.value.data;
@@ -129,13 +142,54 @@ function unaryFn(op, f, df) {
   );
 }
 
-export const add = binary(
+/**
+ * Let an associative op take any number of operands, by folding left.
+ *
+ * JavaScript has no operator overloading, so a model's mean cannot be written
+ * `mu0 + tau * z + gamma` the way PyMC writes it: `+` on a `Var` is not
+ * something this package can define. What it CAN remove is the nesting that
+ * comes from a strictly binary op, which is what actually makes a five-term
+ * sum unreadable:
+ *
+ *     add(add(add(add(a, b), c), d), e)      // before
+ *     add(a, b, c, d, e)                     // after
+ *
+ * The fold builds exactly the graph the nested form did, so nothing about
+ * differentiation, broadcasting or cost changes. Only `add` and `mul` get
+ * this. `sub` and `div` stay binary on purpose: `sub(a, b, c)` would have to
+ * mean `a - b - c`, which reads like it might mean something else, and a
+ * subtraction chain is rare enough not to be worth the ambiguity.
+ *
+ * @private
+ */
+function variadic(op, binaryOp) {
+  return (...args) => {
+    if (args.length < 2) {
+      throw new Error(`${op}: needs at least two operands, got ${args.length}`);
+    }
+    let acc = binaryOp(args[0], args[1]);
+    for (let i = 2; i < args.length; i++) acc = binaryOp(acc, args[i]);
+    return acc;
+  };
+}
+
+/**
+ * Sum of two or more operands, elementwise, broadcasting a scalar against
+ * anything.
+ *
+ * @param {...(Var|number|number[]|number[][])} operands - at least two
+ * @returns {Var}
+ *
+ * @example
+ * const mu = add(intercept, mul(slope, X), seasonOffset);
+ */
+export const add = variadic('add', binary(
   'add',
   (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = A[i * sa] + B[i * sb]; },
   (g, ga, gb, _A, _B, _out, _sa, _sb, n) => {
     for (let i = 0; i < n; i++) { ga[i] = g[i]; gb[i] = g[i]; }
   },
-);
+));
 
 export const sub = binary(
   'sub',
@@ -145,7 +199,14 @@ export const sub = binary(
   },
 );
 
-export const mul = binary(
+/**
+ * Product of two or more operands, elementwise, broadcasting a scalar against
+ * anything.
+ *
+ * @param {...(Var|number|number[]|number[][])} operands - at least two
+ * @returns {Var}
+ */
+export const mul = variadic('mul', binary(
   'mul',
   (out, A, B, sa, sb, n) => { for (let i = 0; i < n; i++) out[i] = A[i * sa] * B[i * sb]; },
   (g, ga, gb, A, B, _out, sa, sb, n) => {
@@ -154,7 +215,7 @@ export const mul = binary(
       gb[i] = g[i] * A[i * sa];
     }
   },
-);
+));
 
 export const div = binary(
   'div',

@@ -71,6 +71,8 @@ describe('compile: elementwise ops replay', () => {
     minimum: (p) => minimum(p.a, p.b),
     relu: (p) => relu(sub(p.a, p.b)),
     'scalar broadcast': (p) => sum(mul(p.a, [1, 2, 3])),
+    'variadic add': (p) => add(p.a, p.b, 2, mul(p.a, p.b)),
+    'variadic mul': (p) => mul(p.a, p.b, 3, add(p.a, 1)),
   };
   for (const [name, f] of Object.entries(cases)) {
     it(name, () => agreesOver(f, scalarPoints));
