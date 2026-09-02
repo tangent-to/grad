@@ -340,6 +340,57 @@ export const minimum = binary(
  * @param {Var|number|number[]|number[][]} a
  * @returns {Var}
  */
+/**
+ * ln|Γ(x)| and its derivative ψ(x), the digamma function. The same Lanczos
+ * (g = 7) and asymptotic-series algorithms `@tangent.to/proba` uses, so the
+ * two agree to rounding; grad carries its own copy rather than a dependency,
+ * because it is the low-level package.
+ * @private
+ */
+const LANCZOS_G = 7;
+const LANCZOS = [
+  0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+  -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6,
+  1.5056327351493116e-7,
+];
+const LN_SQRT_2PI = 0.9189385332046727;
+function lgammaScalar(x) {
+  if (Number.isNaN(x)) return NaN;
+  if (x <= 0 && Number.isInteger(x)) return Infinity;
+  if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgammaScalar(1 - x);
+  const z = x - 1;
+  let sum = LANCZOS[0];
+  for (let i = 1; i < LANCZOS.length; i++) sum += LANCZOS[i] / (z + i);
+  const t = z + LANCZOS_G + 0.5;
+  return LN_SQRT_2PI + (z + 0.5) * Math.log(t) - t + Math.log(sum);
+}
+function digammaScalar(x) {
+  if (Number.isNaN(x)) return NaN;
+  if (x <= 0 && Number.isInteger(x)) return NaN;
+  if (x < 0) return digammaScalar(1 - x) - Math.PI / Math.tan(Math.PI * x);
+  let result = 0;
+  while (x < 10) { result -= 1 / x; x += 1; }
+  const inv = 1 / x;
+  const inv2 = inv * inv;
+  result += Math.log(x) - 0.5 * inv -
+    inv2 * (1 / 12 - inv2 * (1 / 120 - inv2 * (1 / 252 - inv2 * (1 / 240 - inv2 / 132))));
+  return result;
+}
+
+/**
+ * Elementwise log-gamma, `ln|Γ(x)|`, with the digamma function as its
+ * derivative. What a Gamma or Beta log-density needs when its shape
+ * parameter is itself being differentiated, as in a hierarchical prior.
+ *
+ * @param {Var|number|number[]|number[][]} aIn
+ * @returns {Var}
+ */
+export const lgamma = unary(
+  'lgamma',
+  (out, A, n) => { for (let i = 0; i < n; i++) out[i] = lgammaScalar(A[i]); },
+  (g, ga, A, _out, n) => { for (let i = 0; i < n; i++) ga[i] = g[i] * digammaScalar(A[i]); },
+);
+
 export const relu = unary(
   'relu',
   // Math.max, not `A[i] > 0 ? A[i] : 0`: the ternary answers 0 for NaN and

@@ -18,7 +18,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   add, addDiag, cholesky, compile, compileFromJSON, concat, diagPart, div, dot, exp, inv,
-  log, logdetPSD, matmul, maximum, mean, minimum, mul, neg, pow, relu, reshape, sigmoid,
+  lgamma, log, logdetPSD, matmul, maximum, mean, minimum, mul, neg, pow, relu, reshape, sigmoid,
   slice, solveGeneral, solvePSD, sqrt, square, sub, sum, tanh, trace, transpose,
   triangularSolve, Var,
 } from '../src/index.js';
@@ -68,6 +68,7 @@ describe('serialize: elementwise ops', () => {
     minimum: (p) => minimum(p.a, p.b),
     relu: (p) => relu(sub(p.a, p.b)),
     'scalar broadcast': (p) => sum(mul(p.a, [1, 2, 3])),
+    lgamma: (p) => lgamma(add(p.a, 2)),
   };
   for (const [name, f] of Object.entries(cases)) it(name, () => roundTrips(f, scalarPoints));
 });

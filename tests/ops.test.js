@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   add, addDiag, diagPart, div, dot, exp, log, matmul, mean, mul, neg, pow,
-  maximum, minimum, relu, reshape, sigmoid, sqrt, square, sub, sum, tanh, trace, transpose,
+  lgamma, maximum, minimum, relu, reshape, sigmoid, sqrt, square, sub, sum, tanh, trace, transpose,
   valueAndGrad, variable,
 } from '../src/index.js';
 import { fdGrad } from './_fd.js';
@@ -331,5 +331,35 @@ describe('variadic add and mul', () => {
     expect(() => sub(1, 2, 3)).toThrow(/takes exactly two operands, got 3/);
     expect(() => div(1, 2, 3)).toThrow(/takes exactly two operands/);
     expect(() => exp(1, 2)).toThrow(/takes exactly one operand, got 2/);
+  });
+});
+
+describe('lgamma', () => {
+  it('matches proba\'s lgamma, which uses the same Lanczos approximation', async () => {
+    const { special } = await import('@tangent.to/proba').catch(() => ({ special: null }));
+    if (!special) return; // proba is not a dependency of grad; the check runs where it is installed
+    for (const x of [0.3, 0.5, 1, 1.5, 2.5, 7, 12.25, 40, 150.5]) {
+      expect(lgamma(x).data[0]).toBeCloseTo(special.lgamma(x), 13);
+    }
+  });
+
+  it('is exact at the integers, where Γ(n) = (n-1)!', () => {
+    expect(lgamma(1).data[0]).toBeCloseTo(0, 14);
+    expect(lgamma(5).data[0]).toBeCloseTo(Math.log(24), 13);
+    expect(lgamma(11).data[0]).toBeCloseTo(Math.log(3628800), 12);
+  });
+
+  it('differentiates to the digamma function, checked by finite differences', () => {
+    for (const x of [0.7, 1.5, 3.2, 9, 25]) {
+      const { gradient } = valueAndGrad((p) => lgamma(p.x))({ x });
+      const [fd] = fdGrad(([v]) => lgamma(v).data[0], [x]);
+      expect(gradient.x).toBeCloseTo(fd, 6);
+    }
+  });
+
+  it('broadcasts over a vector', () => {
+    const { value, gradient } = valueAndGrad((p) => sum(lgamma(p.v)))({ v: [1, 2, 3] });
+    expect(value).toBeCloseTo(Math.log(1) + Math.log(1) + Math.log(2), 13);
+    expect(gradient.v).toHaveLength(3);
   });
 });
