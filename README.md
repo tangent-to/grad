@@ -177,8 +177,28 @@ ways to break that, and both take deliberate effort to write: branching on a
 parameter's numeric value by reaching into `.data`, or closing over data that
 is mutated between calls. A branch *inside* an op is fine, and is the reason
 `relu` and `maximum` exist: the kernel picks a side per element while the graph
-stays put. A change in a parameter's shape is detected and rebuilds the plan,
-so varying dimensions cost a rebuild rather than a wrong answer.
+stays put.
+
+Data that changes between calls is not a constant. Pass it as **inputs**, the
+second argument: leaves the plan writes on every call exactly as it writes the
+parameters, and reads no gradient from. A mini-batch, a dropout mask, a
+per-fit coefficient:
+
+```js
+const step = compile((p, d) => loss(net(p, d.X), d.y));
+for (const [X, y] of batches) update(p, step(p, { X, y }).gradient);
+step.value(p, { X: Xval, y: yval });   // forward replay alone, no backward sweep
+```
+
+`.value` is the forward pass by itself, and its root need not be a scalar: a
+network's predictions replay through the same plan as its loss. A change in a
+parameter's or an input's shape builds another plan, and a handful are kept by
+shape, so a loop alternating a full batch with a partial last batch pays for
+each shape once.
+
+A parameter may be given as a tensor, `{ data: Float64Array, shape }`, and its
+gradient comes back as one; a training loop then keeps its weights and its
+optimizer state as typed arrays with no conversion on either side of the call.
 
 `valueAndGradFns(f, { compile: true })` opts the mc pair in. It is off by
 default because a static graph is an assumption about your objective, and one
@@ -202,7 +222,9 @@ again(p1);                                // bit-identical to vg(p1)
 A rebuilt plan has no objective to re-trace, so it evaluates only at the
 shapes it was built for and throws on any other. Every op records its exported
 name and its static arguments for this; a `Var` built by hand outside the
-package's ops cannot be serialized and `toJSON` says so.
+package's ops cannot be serialized and `toJSON` says so. Inputs travel as
+named leaves without data, and the rebuilt plan asks for them again on every
+call: what the closure captured is inside the plan, what it was fed is not.
 
 ## Where this pays, and where it does not
 
@@ -238,12 +260,14 @@ what a wide Jacobian would want.
 | | |
 |---|---|
 | `variable(x)`, `Var` | tape leaves and nodes |
-| `valueAndGrad(f)`, `grad(f)` | differentiate a scalar objective |
-| `compile(f)` | the same, reusing the tape across calls; see [Cost](#cost-and-compile). `.toJSON()` writes the graph out as data |
+| `tensor(data, shape)`, `isTensor(x)` | the typed-array form a parameter may take, and get its gradient back in |
+| `valueAndGrad(f)`, `grad(f)` | differentiate a scalar objective `f(params, inputs?)`; `.value(params, inputs?)` evaluates it alone |
+| `compile(f)` | the same, reusing the tape across calls; see [Cost](#cost-and-compile). `.value()` replays the forward pass alone; `.toJSON()` writes the graph out as data |
 | `compileFromJSON(json)` | rebuild a compiled objective from that data, on any thread |
 | `valueAndGradFns(f, opts)` | the `(fn, gradFn)` pair mc's `potential` takes |
-| `add` `mul` | elementwise, scalar broadcasting, and variadic: `add(a, b, c, d)` |
+| `add` `mul` | elementwise, and variadic: `add(a, b, c, d)` |
 | `sub` `div` `neg` | the same, strictly binary |
+| | binary ops broadcast a scalar against anything, and a vector against the rows of a matrix: `add(matmul(X, W), b)` |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
 | `sum` `mean` | reductions to a scalar |
@@ -252,9 +276,10 @@ what a wide Jacobian would want.
 | `solveGeneral` `inv` | the same for a general square matrix (LU) |
 | `jacobian(f)` | ∂f/∂x for a vector-valued f |
 
-`valueAndGrad` accepts either a plain array (what an optimizer passes) or a
-`{name: value}` map (what a probabilistic model passes), and returns the
-gradient in the same shape.
+`valueAndGrad` accepts a plain array (what an optimizer passes), a
+`{name: value}` map (what a probabilistic model passes), or tensors in either
+place, and returns the gradient in the same form. Inputs are always a
+`{name: value}` map.
 
 ## License
 

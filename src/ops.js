@@ -1,34 +1,55 @@
 /**
  * Differentiable operations.
  *
- * Broadcasting is deliberately limited to "scalar against anything". Full
- * numpy-style broadcasting would double the size of every adjoint here for
- * cases the suite's models do not use; a scalar rate against a vector, or a
- * scalar penalty against a matrix, covers them.
+ * Broadcasting is deliberately limited to two cases: a scalar against
+ * anything, and a vector against the rows of a matrix (`[n, d]` with `[d]`).
+ * Full numpy-style broadcasting would double the size of every adjoint here
+ * for cases the suite's models do not use. The scalar case covers a rate
+ * against a vector or a penalty against a matrix; the row case is a bias
+ * added to every row of `X·W`, or a column scaling, and its adjoint is a
+ * column sum, which costs nothing extra.
  */
 
 import { sameShape, shapeStr, sizeOf, zeros } from './tensor.js';
 import { node, requireSameShape, toVar } from './tape.js';
 
 /**
- * Fold a gradient contribution back onto a parent that was broadcast.
- * A scalar parent receives the SUM over the output it was spread across.
+ * Fold a gradient contribution back onto a scalar parent that was broadcast:
+ * the SUM over the output it was spread across.
  * @private
  */
-function unbroadcast(contrib, parentShape) {
-  if (parentShape.length !== 0 || contrib.length === 1) return contrib;
+function unbroadcastScalar(contrib) {
+  if (contrib.length === 1) return contrib;
   let s = 0;
   for (let i = 0; i < contrib.length; i++) s += contrib[i];
   return Float64Array.of(s);
 }
 
 /**
- * Shape of an elementwise result, allowing a scalar on either side.
+ * Fold a gradient contribution back onto a vector parent that was spread over
+ * the rows of a matrix: each column sums back into its entry. `out` is the
+ * parent-sized buffer the op allocated once.
+ * @private
+ */
+function foldRows(contrib, out) {
+  const d = out.length;
+  out.fill(0);
+  for (let o = 0; o < contrib.length; o += d) {
+    for (let j = 0; j < d; j++) out[j] += contrib[o + j];
+  }
+  return out;
+}
+
+/**
+ * Shape of an elementwise result, allowing a scalar on either side, or a
+ * vector against a matrix whose rows have that length.
  * @private
  */
 function broadcastShape(a, b, op) {
   if (a.shape.length === 0) return b.shape;
   if (b.shape.length === 0) return a.shape;
+  if (a.shape.length === 2 && b.shape.length === 1 && a.shape[1] === b.shape[0]) return a.shape;
+  if (b.shape.length === 2 && a.shape.length === 1 && b.shape[1] === a.shape[0]) return b.shape;
   requireSameShape(a, b, op);
   return a.shape;
 }
@@ -41,6 +62,17 @@ function broadcastShape(a, b, op) {
  * @private
  */
 const strideOf = (v) => (v.shape.length === 0 ? 0 : 1);
+
+/**
+ * A vector broadcast over the rows of a matrix is read through a buffer that
+ * holds it tiled to the output's size, refilled on every forward pass. That
+ * keeps the kernels to the two strides above instead of teaching each of them
+ * a modulo, and it keeps the backward kernels reading the same buffer.
+ * @private
+ */
+function tile(dst, src) {
+  for (let o = 0; o < dst.length; o += src.length) dst.set(src, o);
+}
 
 /**
  * Build a binary elementwise op from a forward and a backward KERNEL.
@@ -79,12 +111,20 @@ function binary(op, fwd, bwd) {
     const b = toVar(bIn, `${op} right operand`);
     const shape = broadcastShape(a, b, op);
     const n = sizeOf(shape);
-    const A = a.value.data;
-    const B = b.value.data;
+    // A row-broadcast operand reads through its tiled copy; the others read
+    // their own storage, a scalar at stride 0.
+    const rowA = a.shape.length === 1 && shape.length === 2;
+    const rowB = b.shape.length === 1 && shape.length === 2;
+    const A = rowA ? new Float64Array(n) : a.value.data;
+    const B = rowB ? new Float64Array(n) : b.value.data;
     const sa = strideOf(a);
     const sb = strideOf(b);
     const out = new Float64Array(n);
-    const forward = () => fwd(out, A, B, sa, sb, n);
+    const forward = () => {
+      if (rowA) tile(A, a.value.data);
+      if (rowB) tile(B, b.value.data);
+      fwd(out, A, B, sa, sb, n);
+    };
     forward();
 
     // Allocated once, refilled on every reverse pass. `backward()` accumulates a
@@ -92,9 +132,13 @@ function binary(op, fwd, bwd) {
     // there is no window in which these could be read stale.
     const ga = new Float64Array(n);
     const gb = new Float64Array(n);
+    const fa = rowA ? new Float64Array(a.shape[0]) : null;
+    const fb = rowB ? new Float64Array(b.shape[0]) : null;
+    const fold = (g, v, f) =>
+      (f !== null ? foldRows(g, f) : v.shape.length === 0 ? unbroadcastScalar(g) : g);
     return node({ data: out, shape: shape.slice() }, [a, b], (g) => {
       bwd(g, ga, gb, A, B, out, sa, sb, n);
-      return [unbroadcast(ga, a.shape), unbroadcast(gb, b.shape)];
+      return [fold(ga, a, fa), fold(gb, b, fb)];
     }, forward, { op });
   };
 }
@@ -176,7 +220,7 @@ function variadic(op, binaryOp) {
 
 /**
  * Sum of two or more operands, elementwise, broadcasting a scalar against
- * anything.
+ * anything and a vector against the rows of a matrix.
  *
  * @param {...(Var|number|number[]|number[][])} operands - at least two
  * @returns {Var}
@@ -202,7 +246,7 @@ export const sub = binary(
 
 /**
  * Product of two or more operands, elementwise, broadcasting a scalar against
- * anything.
+ * anything and a vector against the rows of a matrix.
  *
  * @param {...(Var|number|number[]|number[][])} operands - at least two
  * @returns {Var}

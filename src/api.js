@@ -10,11 +10,20 @@
  *     (`@tangent.to/mc`) passes, and what its samplers expect back.
  *
  * The gradient comes back in the same shape it went in, so it drops straight
- * into a leapfrog step or an L-BFGS iteration with no marshalling.
+ * into a leapfrog step or an L-BFGS iteration with no marshalling. A parameter
+ * given as a tensor, `{ data: Float64Array, shape }`, gets its gradient back
+ * as a tensor, which is the form a training loop keeps its state in.
+ *
+ * An objective may take a second argument, a map of INPUTS: leaves of the tape
+ * that are not differentiated and change between calls — a mini-batch, a
+ * dropout mask, a forcing term. `f(params, inputs)` is evaluated at
+ * `vg(params, inputs)`, and a compiled plan writes the new inputs into its
+ * leaves the way it writes the new parameters, instead of freezing them as
+ * constants.
  */
 
 import { Var, topoOrder, variable } from './tape.js';
-import { shapeStr, sizeOf, toNested } from './tensor.js';
+import { isTensor, shapeStr, sizeOf, toNested } from './tensor.js';
 import * as ops from './ops.js';
 import * as linalg from './linalg.js';
 
@@ -30,22 +39,74 @@ const REGISTRY = Object.fromEntries(
 /** Is this a `{name: value}` parameter map rather than a single value? @private */
 function isParamMap(x) {
   return x !== null && typeof x === 'object' && !Array.isArray(x) &&
-    !(x instanceof Float64Array) && !(x instanceof Var);
+    !(x instanceof Float64Array) && !(x instanceof Var) && !isTensor(x);
 }
 
 /**
- * Read a leaf's accumulated gradient back into the shape its input arrived in.
+ * Read a leaf's accumulated gradient back into the form its input arrived in:
+ * a number, nested arrays, or a tensor for a tensor.
  * @private
  */
 function gradOf(v, original) {
-  if (v.grad === null) {
-    // The objective never touched this parameter. A zero gradient is the honest
-    // answer, and silently omitting the key would break a sampler that indexes
-    // every parameter by name.
-    return typeof original === 'number' ? 0 : new Array(v.value.data.length).fill(0);
+  // The objective may never have touched this parameter. A zero gradient is
+  // the honest answer, and silently omitting the key would break a sampler
+  // that indexes every parameter by name.
+  const g = v.grad === null ? new Float64Array(v.value.data.length) : v.grad;
+  if (isTensor(original)) {
+    // A copy: a plan reuses its gradient buffers on the next call, and the
+    // caller's Adam state must not be reading one that is being refilled.
+    return { data: Float64Array.from(g), shape: v.shape.slice() };
   }
-  const t = { data: v.grad, shape: v.shape };
-  return toNested(t);
+  if (typeof original === 'number') return g[0];
+  return toNested({ data: g, shape: v.shape });
+}
+
+/**
+ * The inputs argument must be a `{name: value}` map, or absent. @private
+ */
+function checkInputs(feed, where) {
+  if (feed === undefined) return;
+  if (!isParamMap(feed)) {
+    throw new Error(`${where}: inputs must be a {name: value} map, got ${typeof feed}`);
+  }
+}
+
+/**
+ * A leaf a plan will write into on every call must own its storage:
+ * `variable()` aliases a Float64Array or a tensor rather than copying it, and
+ * evaluating at new values would otherwise scribble over the caller's array
+ * from the first call. @private
+ */
+function ownedCopy(v) {
+  if (typeof v === 'number') return v;
+  if (isTensor(v)) return { data: Float64Array.from(v.data), shape: v.shape.slice() };
+  return Array.from(v, (e) => (Array.isArray(e) || e instanceof Float64Array ? Array.from(e) : e));
+}
+
+/**
+ * Wrap parameters as leaves, in the structure they arrived in. @private
+ * @returns {{ isMap: boolean, leaves: Var|Object<string,Var> }}
+ */
+function wrapParams(x, own) {
+  if (isParamMap(x)) {
+    const leaves = {};
+    for (const [k, v] of Object.entries(x)) leaves[k] = variable(own ? ownedCopy(v) : v, `parameter "${k}"`);
+    return { isMap: true, leaves };
+  }
+  return { isMap: false, leaves: variable(own ? ownedCopy(x) : x, 'parameter') };
+}
+
+/** Wrap inputs as leaves that no gradient is read from. @private */
+function wrapInputs(feed, own) {
+  if (feed === undefined) return null;
+  const leaves = {};
+  for (const [k, v] of Object.entries(feed)) leaves[k] = variable(own ? ownedCopy(v) : v, `input "${k}"`);
+  return leaves;
+}
+
+/** The root's value in the boundary currency: a number for a scalar, nested rows otherwise. @private */
+function rootValue(root) {
+  return root.isScalar ? root.data[0] : toNested(root.value);
 }
 
 /**
@@ -71,41 +132,43 @@ function requireScalarObjective(out, where) {
 /**
  * Differentiate a scalar objective, returning both value and gradient.
  *
- * @param {(x: any) => Var} f - objective, built from this package's ops. It
- *   receives `Var`s in the same structure as the input and must return a
- *   scalar `Var`.
- * @returns {(x: any) => { value: number, gradient: any }}
+ * @param {(x: any, inputs?: any) => Var} f - objective, built from this
+ *   package's ops. It receives `Var`s in the same structure as the parameters,
+ *   and, when the returned function is called with a second argument, a map of
+ *   input `Var`s as its own second argument. It must return a scalar `Var`.
+ * @returns {(x: any, inputs?: Object) => { value: number, gradient: any }}
+ *   with a `.value(x, inputs)` that evaluates the objective alone, and may
+ *   return a non-scalar in the boundary currency.
  *
  * @example
  * const f = (p) => add(square(p.mu), square(p.sigma));
  * valueAndGrad(f)({ mu: 3, sigma: 4 });
  * // { value: 25, gradient: { mu: 6, sigma: 8 } }
+ *
+ * @example
+ * // Data as inputs rather than closed-over constants: the same objective
+ * // evaluates on any batch.
+ * const sse = (p, d) => sum(square(sub(d.y, mul(p.slope, d.x))));
+ * valueAndGrad(sse)({ slope: 2 }, { x: [1, 2], y: [2, 5] });
  */
 export function valueAndGrad(f) {
   if (typeof f !== 'function') throw new Error('valueAndGrad: expected a function');
 
-  return (x) => {
-    let wrapped;
-    let leaves;
-    if (isParamMap(x)) {
-      wrapped = {};
-      leaves = {};
-      for (const [k, v] of Object.entries(x)) {
-        leaves[k] = variable(v, `parameter "${k}"`);
-        wrapped[k] = leaves[k];
-      }
-    } else {
-      leaves = variable(x, 'parameter');
-      wrapped = leaves;
-    }
+  const trace = (x, feed, where) => {
+    checkInputs(feed, where);
+    const { isMap, leaves } = wrapParams(x, false);
+    const inputs = wrapInputs(feed, false);
+    const out = inputs === null ? f(leaves) : f(leaves, inputs);
+    if (!(out instanceof Var)) requireScalarObjective(out, where);
+    return { isMap, leaves, out };
+  };
 
-    const out = f(wrapped);
+  const vg = (x, feed) => {
+    const { isMap, leaves, out } = trace(x, feed, 'valueAndGrad');
     requireScalarObjective(out, 'valueAndGrad');
-
     out.backward();
-
     let gradient;
-    if (isParamMap(x)) {
+    if (isMap) {
       gradient = {};
       for (const k of Object.keys(x)) gradient[k] = gradOf(leaves[k], x[k]);
     } else {
@@ -113,23 +176,30 @@ export function valueAndGrad(f) {
     }
     return { value: out.data[0], gradient };
   };
+  vg.value = (x, feed) => rootValue(trace(x, feed, 'valueAndGrad.value').out);
+  return vg;
 }
 
 /**
  * Gradient only, discarding the objective's value.
  *
- * @param {(x: any) => Var} f
- * @returns {(x: any) => any} gradient, shaped like the input
+ * @param {(x: any, inputs?: any) => Var} f
+ * @returns {(x: any, inputs?: Object) => any} gradient, shaped like the parameters
  */
 export function grad(f) {
   const vg = valueAndGrad(f);
-  return (x) => vg(x).gradient;
+  return (x, feed) => vg(x, feed).gradient;
 }
 
 /** Structural equality over a `{name: number|number[]}` parameter map. @private */
 function sameParams(a, b) {
   if (a === undefined || b === undefined) return false;
   if (typeof a === 'number') return a === b;
+  if (isTensor(a)) {
+    if (!isTensor(b) || a.data.length !== b.data.length) return false;
+    for (let i = 0; i < a.data.length; i++) if (a.data[i] !== b.data[i]) return false;
+    return true;
+  }
   if (Array.isArray(a) || a instanceof Float64Array) {
     if (!(Array.isArray(b) || b instanceof Float64Array) || a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
@@ -146,6 +216,7 @@ function sameParams(a, b) {
  * poison the cache below. @private */
 function copyParams(x) {
   if (typeof x === 'number') return x;
+  if (isTensor(x)) return { data: Float64Array.from(x.data), shape: x.shape.slice() };
   if (Array.isArray(x) || x instanceof Float64Array) return Array.from(x);
   const out = {};
   for (const [k, v] of Object.entries(x)) out[k] = copyParams(v);
@@ -164,7 +235,10 @@ function copyParams(x) {
  *
  * The cache holds exactly one entry and compares parameters structurally
  * against a defensive copy, so mutating a parameter array in place invalidates
- * it correctly rather than returning a stale gradient.
+ * it correctly rather than returning a stale gradient. A call that passes
+ * inputs bypasses the cache: the same parameters on a different batch are a
+ * different evaluation, and copying a batch to compare it would cost what the
+ * cache saves.
  *
  * @param {(x: any) => Var} f - objective built from this package's ops
  * @param {Object} [options]
@@ -201,15 +275,16 @@ export function valueAndGradFns(f, options = {}) {
 export function splitValueAndGrad(vg) {
   let lastInput;
   let lastResult;
-  const evaluate = (x) => {
+  const evaluate = (x, feed) => {
+    if (feed !== undefined) return vg(x, feed);
     if (lastResult !== undefined && sameParams(lastInput, x)) return lastResult;
     lastResult = vg(x);
     lastInput = copyParams(x);
     return lastResult;
   };
   return {
-    value: (x) => evaluate(x).value,
-    gradient: (x) => evaluate(x).gradient,
+    value: (x, feed) => evaluate(x, feed).value,
+    gradient: (x, feed) => evaluate(x, feed).gradient,
   };
 }
 
@@ -284,6 +359,7 @@ export function jacobian(f) {
  */
 function signatureOf(x) {
   if (typeof x === 'number') return 's';
+  if (isTensor(x)) return shapeSig(x.shape);
   if (Array.isArray(x) || x instanceof Float64Array) {
     const first = x[0];
     if (Array.isArray(first) || first instanceof Float64Array) {
@@ -294,11 +370,20 @@ function signatureOf(x) {
   return Object.keys(x).sort().map((k) => `${k}:${signatureOf(x[k])}`).join(',');
 }
 
+/** The fingerprint a plan is cached under: parameters, then inputs. @private */
+function planSignature(x, feed) {
+  return feed === undefined ? signatureOf(x) : `${signatureOf(x)}|${signatureOf(feed)}`;
+}
+
 /** Overwrite a leaf's storage with a fresh value of the same shape. @private */
 function writeLeaf(leaf, v) {
   const d = leaf.value.data;
   if (typeof v === 'number') {
     d[0] = v;
+    return;
+  }
+  if (isTensor(v)) {
+    d.set(v.data);
     return;
   }
   const first = v[0];
@@ -316,52 +401,47 @@ function writeLeaf(leaf, v) {
 /**
  * Build the reusable plan: run `f` once, then keep the graph.
  * Returns null if any node cannot be replayed, which sends the caller back to
- * the ordinary rebuild-every-time path. @private
+ * the ordinary rebuild-every-time path. The root is not required to be a
+ * scalar here: a forward-only replay (`compiled.value`) may return a vector or
+ * a matrix, and the gradient path checks for itself. @private
  */
-function buildPlan(f, x) {
-  const isMap = isParamMap(x);
-  let wrapped;
-  let leaves;
-  if (isMap) {
-    wrapped = {};
-    leaves = {};
-    for (const [k, v] of Object.entries(x)) {
-      // variable() aliases a Float64Array argument rather than copying it. The
-      // plan writes into its leaves on every call, so it must own their
-      // storage — otherwise evaluating at new parameters would scribble over
-      // the caller's array from the first call.
-      leaves[k] = variable(typeof v === 'number' ? v : Array.from(v, (e) => (Array.isArray(e) || e instanceof Float64Array ? Array.from(e) : e)), `parameter "${k}"`);
-      wrapped[k] = leaves[k];
-    }
-  } else {
-    leaves = variable(typeof x === 'number' ? x : Array.from(x, (e) => (Array.isArray(e) || e instanceof Float64Array ? Array.from(e) : e)), 'parameter');
-    wrapped = leaves;
-  }
-
-  const out = f(wrapped);
-  requireScalarObjective(out, 'compile');
+function buildPlan(f, x, feed) {
+  const { isMap, leaves } = wrapParams(x, true);
+  const inputs = wrapInputs(feed, true);
+  const out = inputs === null ? f(leaves) : f(leaves, inputs);
+  if (!(out instanceof Var)) requireScalarObjective(out, 'compile');
 
   const order = topoOrder(out);
   for (const nd of order) {
     if (nd.parents.length > 0 && !nd._recompute) return null; // a hand-built node
     nd.grad = new Float64Array(nd.value.data.length);
   }
-  return { isMap, leaves, root: out, order, signature: signatureOf(x) };
+  return { isMap, leaves, inputs, root: out, order, signature: planSignature(x, feed) };
 }
 
-/** Evaluate a built plan at new parameters. @private */
-function runPlan(plan, x) {
-  const { isMap, leaves, root, order } = plan;
+/** Write new parameters and inputs into a plan's leaves and recompute. @private */
+function replayForward(plan, x, feed) {
+  const { isMap, leaves, inputs, order } = plan;
   if (isMap) {
     for (const k of Object.keys(leaves)) writeLeaf(leaves[k], x[k]);
   } else {
     writeLeaf(leaves, x);
   }
-
+  if (inputs !== null) {
+    // The signature matched, so every input the plan has is in `feed`.
+    for (const k of Object.keys(inputs)) writeLeaf(inputs[k], feed[k]);
+  }
   for (let i = 0; i < order.length; i++) {
     const r = order[i]._recompute;
     if (r !== null) r();
   }
+}
+
+/** Evaluate a built plan at new parameters, with the gradient. @private */
+function runPlan(plan, x, feed) {
+  const { isMap, leaves, root, order } = plan;
+  replayForward(plan, x, feed);
+  requireScalarObjective(root, 'compile');
 
   for (let i = 0; i < order.length; i++) order[i].grad.fill(0);
   root.grad[0] = 1;
@@ -387,6 +467,20 @@ function runPlan(plan, x) {
   return { value: root.data[0], gradient };
 }
 
+/** Evaluate a built plan at new parameters, forward only. @private */
+function runPlanValue(plan, x, feed) {
+  replayForward(plan, x, feed);
+  return rootValue(plan.root);
+}
+
+/**
+ * How many plans one compiled objective keeps, by shape. A training loop has
+ * two (the batch and the partial last batch) and a `predict` a third; a
+ * sampler has one. Beyond a handful, something is varying that should not be.
+ * @private
+ */
+const MAX_PLANS = 8;
+
 /**
  * Like {@link valueAndGrad}, but the tape is built once and replayed.
  *
@@ -411,42 +505,75 @@ function runPlan(plan, x) {
  * the kernel picks a side per element, while the graph stays put. If your
  * objective needs a genuine structural branch, use `valueAndGrad`.
  *
- * A change in a parameter's SHAPE is detected and rebuilds the plan, so
- * varying dimensions cost a rebuild rather than a wrong answer.
+ * Data that changes between calls is not a constant: pass it as INPUTS, the
+ * second argument. The plan writes new inputs into its leaves exactly as it
+ * writes new parameters, and reads no gradient from them. A mini-batch, a
+ * dropout mask, a per-fit coefficient all go this way.
  *
- * @param {(x: any) => Var} f - objective, as for {@link valueAndGrad}
- * @returns {(x: any) => { value: number, gradient: any }}
+ * A change in a parameter's or an input's SHAPE builds another plan, and the
+ * plans are kept by shape (a handful of them), so a loop that alternates a
+ * full batch and a partial last batch pays for each shape once.
+ *
+ * @param {(x: any, inputs?: any) => Var} f - objective, as for {@link valueAndGrad}
+ * @returns {(x: any, inputs?: Object) => { value: number, gradient: any }}
+ *   with `.value(x, inputs)`, the forward replay alone, which returns the
+ *   root's value and may be a vector or a matrix; and `.toJSON()`, the plan as
+ *   data.
  *
  * @example
  * const vg = compile((p) => negLogLik(p));
  * for (const p of chain) vg(p);   // one graph, many evaluations
+ *
+ * @example
+ * const step = compile((p, d) => loss(net(p, d.X), d.y));
+ * for (const [X, y] of batches) update(p, step(p, { X, y }).gradient);
+ * step.value(p, { X: Xval, y: yval });   // the validation loss, no backward sweep
  */
 export function compile(f) {
   if (typeof f !== 'function') throw new Error('compile: expected a function');
   const fallback = valueAndGrad(f);
-  let plan;
+  const plans = new Map();
+  let last;
   let refused = false;
 
-  const compiled = (x) => {
-    if (refused) return fallback(x);
-    if (plan === undefined || plan.signature !== signatureOf(x)) {
-      plan = buildPlan(f, x);
+  const planFor = (x, feed) => {
+    checkInputs(feed, 'compile');
+    const sig = planSignature(x, feed);
+    let plan = plans.get(sig);
+    if (plan === undefined) {
+      plan = buildPlan(f, x, feed);
       if (plan === null) {
         // The objective reached the tape through something other than this
         // package's ops. Nothing is wrong with that graph, it just cannot be
         // replayed, so fall back rather than refuse to differentiate.
         refused = true;
-        return fallback(x);
+        return null;
       }
+      plans.set(sig, plan);
+      if (plans.size > MAX_PLANS) plans.delete(plans.keys().next().value);
     }
-    return runPlan(plan, x);
+    last = plan;
+    return plan;
+  };
+
+  const compiled = (x, feed) => {
+    if (refused) return fallback(x, feed);
+    const plan = planFor(x, feed);
+    return plan === null ? fallback(x, feed) : runPlan(plan, x, feed);
+  };
+
+  compiled.value = (x, feed) => {
+    if (refused) return fallback.value(x, feed);
+    const plan = planFor(x, feed);
+    return plan === null ? fallback.value(x, feed) : runPlanValue(plan, x, feed);
   };
 
   /**
    * The graph as data: every node's op and static arguments, every constant's
-   * values, every parameter's name and shape. See {@link compileFromJSON}.
-   * The graph exists only after a first call, since its shapes come from the
-   * input.
+   * values, every parameter's and input's name and shape. See
+   * {@link compileFromJSON}. The graph exists only after a first call, since
+   * its shapes come from the arguments, and it is the graph of the shapes
+   * most recently evaluated.
    */
   compiled.toJSON = () => {
     if (refused) {
@@ -455,10 +582,10 @@ export function compile(f) {
           'which cannot be replayed or serialized.',
       );
     }
-    if (plan === undefined) {
+    if (last === undefined) {
       throw new Error('toJSON: call the compiled function once first, so the graph is built.');
     }
-    return serializePlan(plan);
+    return serializePlan(last);
   };
   return compiled;
 }
@@ -472,7 +599,7 @@ function shapeSig(shape) {
 
 /** @private */
 function serializePlan(plan) {
-  const { isMap, leaves, root, order } = plan;
+  const { isMap, leaves, inputs, root, order } = plan;
   const index = new Map();
   const nodes = [];
   const push = (nd, entry) => {
@@ -487,6 +614,11 @@ function serializePlan(plan) {
   } else {
     push(leaves, { kind: 'param', shape: leaves.shape.slice() });
   }
+  // Inputs likewise: one the graph never reads is still part of the call
+  // signature, and a rebuilt plan must ask for the same map.
+  if (inputs !== null) {
+    for (const [name, v] of Object.entries(inputs)) push(v, { kind: 'input', name, shape: v.shape.slice() });
+  }
   for (const nd of order) {
     if (index.has(nd)) continue;
     if (nd.parents.length === 0) {
@@ -498,7 +630,9 @@ function serializePlan(plan) {
     if (nd.spec.list) entry.list = true;
     push(nd, entry);
   }
-  return { version: 1, input: isMap ? 'map' : 'single', nodes, root: index.get(root) };
+  // Version 2 adds the `input` node kind; a reader of version 1 would not
+  // know what to do with one. A plan without inputs is still written as 2.
+  return { version: 2, input: isMap ? 'map' : 'single', nodes, root: index.get(root) };
 }
 
 /**
@@ -509,10 +643,12 @@ function serializePlan(plan) {
  * it has no objective function to fall back to, so it evaluates only at the
  * shapes it was built for and throws on any other. That is the point. A
  * worker cannot receive a closure, but it can receive this, and the data the
- * closure captured travels inside it as constant leaves.
+ * closure captured travels inside it as constant leaves; the data the closure
+ * took as inputs is asked for again, by name, on every call.
  *
  * @param {Object} json - the value `compiled.toJSON()` returned
- * @returns {(x: any) => { value: number, gradient: any }}
+ * @returns {(x: any, inputs?: Object) => { value: number, gradient: any }}
+ *   with `.value(x, inputs)` as on {@link compile}
  *
  * @example
  * const vg = compile(negLogLik);
@@ -522,14 +658,16 @@ function serializePlan(plan) {
  * again(p1);                                // same gradient the original gives
  */
 export function compileFromJSON(json) {
-  if (!json || json.version !== 1 || !Array.isArray(json.nodes)) {
+  if (!json || !(json.version === 1 || json.version === 2) || !Array.isArray(json.nodes)) {
     throw new Error('compileFromJSON: not a serialized plan');
   }
   const isMap = json.input === 'map';
   const vars = new Array(json.nodes.length);
   const leaves = isMap ? {} : null;
   let single = null;
+  let inputs = null;
   const sigParts = [];
+  const inputParts = [];
 
   json.nodes.forEach((n, i) => {
     if (n.kind === 'param') {
@@ -542,6 +680,12 @@ export function compileFromJSON(json) {
         single = v;
         sigParts.push(['', shapeSig(n.shape)]);
       }
+    } else if (n.kind === 'input') {
+      const v = variable({ data: new Float64Array(sizeOf(n.shape)), shape: n.shape.slice() });
+      vars[i] = v;
+      if (inputs === null) inputs = {};
+      inputs[n.name] = v;
+      inputParts.push([n.name, shapeSig(n.shape)]);
     } else if (n.kind === 'const') {
       vars[i] = variable({ data: Float64Array.from(n.data), shape: n.shape.slice() });
     } else {
@@ -555,19 +699,29 @@ export function compileFromJSON(json) {
   const root = vars[json.root];
   const order = topoOrder(root);
   for (const nd of order) nd.grad = new Float64Array(nd.value.data.length);
-  const signature = isMap
-    ? sigParts.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, v]) => `${k}:${v}`).join(',')
-    : sigParts[0][1];
-  const plan = { isMap, leaves: isMap ? leaves : single, root, order, signature };
+  const joined = (parts) =>
+    parts.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, v]) => `${k}:${v}`).join(',');
+  const paramSig = isMap ? joined(sigParts) : sigParts[0][1];
+  const signature = inputs === null ? paramSig : `${paramSig}|${joined(inputParts)}`;
+  const plan = { isMap, leaves: isMap ? leaves : single, inputs, root, order, signature };
 
-  return (x) => {
-    const got = signatureOf(x);
+  const check = (x, feed) => {
+    checkInputs(feed, 'compileFromJSON');
+    const got = planSignature(x, feed);
     if (got !== signature) {
       throw new Error(
-        `compileFromJSON: this plan was built for parameters shaped ${signature}, ` +
+        `compileFromJSON: this plan was built for arguments shaped ${signature}, ` +
           `got ${got}. A rebuilt plan has no objective to re-trace, so it cannot adapt.`,
       );
     }
-    return runPlan(plan, x);
   };
+  const rebuilt = (x, feed) => {
+    check(x, feed);
+    return runPlan(plan, x, feed);
+  };
+  rebuilt.value = (x, feed) => {
+    check(x, feed);
+    return runPlanValue(plan, x, feed);
+  };
+  return rebuilt;
 }

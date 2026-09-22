@@ -181,7 +181,7 @@ describe('serialize: input shapes', () => {
       if (x && typeof x === 'object') Object.values(x).forEach(walk);
     };
     walk(json);
-    expect(json.version).toBe(1);
+    expect(json.version).toBe(2);
   });
 });
 
@@ -202,7 +202,7 @@ describe('serialize: refusals', () => {
     const c = compile((p) => sum(square(p.v)));
     c({ v: [1, 2] });
     const rebuilt = compileFromJSON(c.toJSON());
-    expect(() => rebuilt({ v: [1, 2, 3] })).toThrow(/built for parameters shaped v:v2, got v:v3/);
+    expect(() => rebuilt({ v: [1, 2, 3] })).toThrow(/built for arguments shaped v:v2, got v:v3/);
   });
 
   it('rejects something that is not a plan', () => {

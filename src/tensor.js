@@ -80,6 +80,17 @@ export function eye(n) {
 }
 
 /**
+ * Is this already a tensor, `{ data: Float64Array, shape }`? The form a caller
+ * may use for a parameter when it wants its gradient back as the same thing,
+ * with no conversion to nested arrays on either side.
+ * @param {*} x
+ * @returns {boolean}
+ */
+export function isTensor(x) {
+  return x !== null && typeof x === 'object' && x.data instanceof Float64Array && Array.isArray(x.shape);
+}
+
+/**
  * Coerce user input to a tensor: a number becomes a scalar, a flat array a
  * vector, a nested array a matrix. An existing tensor passes through untouched.
  *
@@ -88,9 +99,7 @@ export function eye(n) {
  * @returns {Tensor}
  */
 export function asTensor(x, name = 'value') {
-  if (x && typeof x === 'object' && x.data instanceof Float64Array && Array.isArray(x.shape)) {
-    return x;
-  }
+  if (isTensor(x)) return x;
   if (typeof x === 'number') {
     // NaN and ±Infinity pass through deliberately. A sampler legitimately
     // probes outside a parameter's support — NUTS steps past σ = 0 on its way
