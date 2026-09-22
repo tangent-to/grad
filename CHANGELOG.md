@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `concat` joins matrices as well as vectors: along rows (`axis: 0`), or
+  side by side along columns (`axis: 1`), which is how a network joins two
+  branches for every row of a batch. The axis is serialized with the plan.
 - **Inputs.** An objective may take a second argument, a `{name: value}` map
   of leaves that are not differentiated and change between calls: a
   mini-batch, a dropout mask, a per-fit coefficient. `valueAndGrad(f)(x,

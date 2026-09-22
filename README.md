@@ -271,7 +271,7 @@ what a wide Jacobian would want.
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
 | `sum` `mean` | reductions to a scalar |
-| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation |
+| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation; `concat(parts, { axis })` joins matrices by rows or by columns |
 | `cholesky` `triangularSolve` `logdetPSD` `solvePSD` | differentiable linear algebra, symmetric positive definite |
 | `solveGeneral` `inv` | the same for a general square matrix (LU) |
 | `jacobian(f)` | ∂f/∂x for a vector-valued f |

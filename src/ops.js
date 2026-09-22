@@ -788,22 +788,25 @@ export function slice(aIn, start, size) {
 }
 
 /**
- * Assemble scalar or vector Vars into one vector, end to end.
+ * Join parts end to end. Scalars and vectors become one vector. Matrices join
+ * along `axis`: 0 stacks their rows (same column count), 1 puts them side by
+ * side (same row count), which is how a network joins the outputs of two
+ * branches for every row of a batch. The adjoint hands each part its slice.
  *
- * The companion to `slice`, and what a vector-valued function needs to return:
- * an ODE right-hand side is written component by component and concatenated.
- *
- * @param {Array<Var|number|number[]>} parts
+ * @param {Array<Var|number|number[]|number[][]>} parts
+ * @param {{ axis?: number }} [options] - for matrices; 0 by default
  * @returns {Var}
  */
-export function concat(parts) {
+export function concat(parts, options = {}) {
   if (!Array.isArray(parts) || parts.length === 0) {
     throw new Error('concat: needs a non-empty array of parts');
   }
   const vars = parts.map((p, i) => toVar(p, `concat part ${i}`));
+  const rank2 = vars[0].shape.length === 2;
+  if (rank2) return concatMatrices(vars, options.axis ?? 0);
   for (const v of vars) {
     if (v.shape.length > 1) {
-      throw new Error(`concat: parts must be scalars or vectors, got ${shapeStr(v.shape)}`);
+      throw new Error(`concat: parts must all be scalars and vectors, or all matrices; got ${shapeStr(v.shape)}`);
     }
   }
   const lengths = vars.map((v) => v.value.data.length);
@@ -826,6 +829,69 @@ export function concat(parts) {
     }
     return contribs;
   }, forward, { op: 'concat', list: true });
+}
+
+/** Matrices along axis 0 (rows) or 1 (columns). @private */
+function concatMatrices(vars, axis) {
+  if (axis !== 0 && axis !== 1) throw new Error('concat: axis must be 0 or 1');
+  for (const v of vars) {
+    if (v.shape.length !== 2) {
+      throw new Error(`concat: parts must all be matrices, got ${shapeStr(v.shape)}`);
+    }
+    if (v.shape[1 - axis] !== vars[0].shape[1 - axis]) {
+      throw new Error(
+        `concat: parts must agree on axis ${1 - axis}, got ${shapeStr(vars[0].shape)} and ${shapeStr(v.shape)}`,
+      );
+    }
+  }
+  if (axis === 0) {
+    // Row-major storage makes stacking rows a plain append.
+    const cols = vars[0].shape[1];
+    const rows = vars.reduce((a, v) => a + v.shape[0], 0);
+    const out = new Float64Array(rows * cols);
+    const forward = () => {
+      let off = 0;
+      for (const v of vars) {
+        out.set(v.value.data, off);
+        off += v.value.data.length;
+      }
+    };
+    forward();
+    return node({ data: out, shape: [rows, cols] }, vars, (g) => {
+      const contribs = [];
+      let o = 0;
+      for (const v of vars) {
+        contribs.push(g.slice(o, o + v.value.data.length));
+        o += v.value.data.length;
+      }
+      return contribs;
+    }, forward, { op: 'concat', list: true, args: [{ axis: 0 }] });
+  }
+  const rows = vars[0].shape[0];
+  const widths = vars.map((v) => v.shape[1]);
+  const cols = widths.reduce((a, b) => a + b, 0);
+  const out = new Float64Array(rows * cols);
+  const forward = () => {
+    let off = 0;
+    for (let k = 0; k < vars.length; k++) {
+      const src = vars[k].value.data;
+      const w = widths[k];
+      for (let i = 0; i < rows; i++) out.set(src.subarray(i * w, i * w + w), i * cols + off);
+      off += w;
+    }
+  };
+  forward();
+  const bufs = widths.map((w) => new Float64Array(rows * w));
+  return node({ data: out, shape: [rows, cols] }, vars, (g) => {
+    let off = 0;
+    for (let k = 0; k < vars.length; k++) {
+      const w = widths[k];
+      const b = bufs[k];
+      for (let i = 0; i < rows; i++) b.set(g.subarray(i * cols + off, i * cols + off + w), i * w);
+      off += w;
+    }
+    return bufs;
+  }, forward, { op: 'concat', list: true, args: [{ axis: 1 }] });
 }
 
 export { zeros, sameShape };
