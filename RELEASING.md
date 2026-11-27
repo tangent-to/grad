@@ -35,6 +35,13 @@ failed JSR half can be re-run without a version collision.
   truth) and `deno.json` (synced by `scripts/sync-version.mjs`). There is no
   `jsr.json`; `deno publish` reads `deno.json`.
 - To dry-run JSR locally: `npm run jsr:publish:dry-run`.
+- `npm run test:dist` runs the whole suite against the minified bundle that
+  npm publishes, rather than the sources. Run it before tagging.
+- The PyTorch and R reference fixtures are committed and checked by the
+  ordinary test run. After changing an op, regenerate them with
+  `npm run references` (needs `python3` with `numpy` and `torch`, and `Rscript`
+  with `jsonlite`) and commit the result; the References workflow reruns them
+  on pull requests and weekly.
 - The JSR job disables Deno's 24-hour dependency cooldown (`deno cache
   --minimum-dependency-age=0`) so this package can be released the same day as an
   intra-suite dependency it was published alongside.

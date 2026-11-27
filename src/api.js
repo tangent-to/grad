@@ -80,7 +80,11 @@ function checkInputs(feed, where) {
 function ownedCopy(v) {
   if (typeof v === 'number') return v;
   if (isTensor(v)) return { data: Float64Array.from(v.data), shape: v.shape.slice() };
-  return Array.from(v, (e) => (Array.isArray(e) || e instanceof Float64Array ? Array.from(e) : e));
+  // Every level, not two: a cache compared against a copy that still shares
+  // its inner arrays with the caller sees an in-place edit on both sides, and
+  // answers with the gradient of the old values.
+  if (v instanceof Float64Array) return Float64Array.from(v);
+  return Array.from(v, (e) => (Array.isArray(e) || e instanceof Float64Array ? ownedCopy(e) : e));
 }
 
 /**
@@ -372,18 +376,24 @@ function planSignature(x, feed) {
 }
 
 /** Overwrite a leaf's storage with a fresh value of the same shape. @private */
-function writeLeaf(leaf, v) {
+function writeLeaf(leaf, v, name = 'parameter') {
   const d = leaf.value.data;
   if (typeof v === 'number') {
     d[0] = v;
     return;
   }
   if (isTensor(v)) {
+    if (v.data.length !== d.length) {
+      throw new Error(`${name}: a tensor of shape ${shapeStr(v.shape)} holds ${v.data.length} values, not ${d.length}`);
+    }
     d.set(v.data);
     return;
   }
+  // The plan signature reads only the first entry at each level, so the rest
+  // is checked as it is written: a ragged row would otherwise leave the
+  // previous call's values in place and answer for them.
   if (typeof v[0] !== 'number' && !(v instanceof Float64Array)) {
-    writeNested(d, v);
+    writeNested(d, v, leaf.shape, name, false);
     return;
   }
   for (let i = 0; i < v.length; i++) d[i] = v[i];
@@ -414,13 +424,13 @@ function buildPlan(f, x, feed) {
 function replayForward(plan, x, feed) {
   const { isMap, leaves, inputs, order } = plan;
   if (isMap) {
-    for (const k of Object.keys(leaves)) writeLeaf(leaves[k], x[k]);
+    for (const k of Object.keys(leaves)) writeLeaf(leaves[k], x[k], `parameter "${k}"`);
   } else {
     writeLeaf(leaves, x);
   }
   if (inputs !== null) {
     // The signature matched, so every input the plan has is in `feed`.
-    for (const k of Object.keys(inputs)) writeLeaf(inputs[k], feed[k]);
+    for (const k of Object.keys(inputs)) writeLeaf(inputs[k], feed[k], `input "${k}"`);
   }
   for (let i = 0; i < order.length; i++) {
     const r = order[i]._recompute;

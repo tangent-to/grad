@@ -18,7 +18,7 @@
 
 import { sameShape, shapeStr, sizeOf, zeros } from './tensor.js';
 import { node, toVar } from './tape.js';
-import { addStrided, copyStrided, stridesOf } from './strided.js';
+import { addStrided, copyStrided, simplify, stridesOf } from './strided.js';
 
 /**
  * Fold a gradient contribution back onto a scalar parent that was broadcast:
@@ -136,16 +136,16 @@ function binary(op, fwd, bwd) {
     const expands = (v) => v.shape.length > 0 && !sameShape(v.shape, shape);
     const ea = expands(a);
     const eb = expands(b);
-    const stA = ea ? broadcastStrides(a.shape, shape) : null;
-    const stB = eb ? broadcastStrides(b.shape, shape) : null;
+    const walkA = ea ? simplify(shape, broadcastStrides(a.shape, shape)) : null;
+    const walkB = eb ? simplify(shape, broadcastStrides(b.shape, shape)) : null;
     const A = ea ? new Float64Array(n) : a.value.data;
     const B = eb ? new Float64Array(n) : b.value.data;
     const sa = strideOf(a);
     const sb = strideOf(b);
     const out = new Float64Array(n);
     const forward = () => {
-      if (ea) copyStrided(A, a.value.data, shape, stA, 0);
-      if (eb) copyStrided(B, b.value.data, shape, stB, 0);
+      if (ea) copyStrided(A, a.value.data, walkA.shape, walkA.strides, 0);
+      if (eb) copyStrided(B, b.value.data, walkB.shape, walkB.strides, 0);
       fwd(out, A, B, sa, sb, n);
     };
 
@@ -156,17 +156,17 @@ function binary(op, fwd, bwd) {
     const gb = new Float64Array(n);
     const fa = ea ? new Float64Array(a.value.data.length) : null;
     const fb = eb ? new Float64Array(b.value.data.length) : null;
-    const fold = (g, v, f, st) => {
+    const fold = (g, v, f, walk) => {
       if (f !== null) {
         f.fill(0);
-        addStrided(f, g, shape, st, 0);
+        addStrided(f, g, walk.shape, walk.strides, 0);
         return f;
       }
       return v.shape.length === 0 ? unbroadcastScalar(g) : g;
     };
     return node({ data: out, shape: shape.slice() }, [a, b], (g) => {
       bwd(g, ga, gb, A, B, out, sa, sb, n);
-      return [fold(ga, a, fa, stA), fold(gb, b, fb, stB)];
+      return [fold(ga, a, fa, walkA), fold(gb, b, fb, walkB)];
     }, forward, { op });
   };
 }
@@ -519,9 +519,25 @@ function reduction(op, a, options) {
 function additiveReduce(op, aIn, options, mean) {
   const a = toVar(aIn, `${op} operand`);
   const { outer, len, inner, shape, args } = reduction(op, a, options);
-  const scale = mean ? 1 / len : 1;
   const A = a.value.data;
   const out = new Float64Array(outer * inner);
+  const ga = new Float64Array(A.length);
+  // A mean divides rather than multiplying by 1/len, as 0.3 did, so a
+  // whole-tensor mean is bit-for-bit what it was.
+  if (inner === 1) {
+    // The whole tensor, or the last axis: each output sums one contiguous run.
+    const forward = () => {
+      for (let o = 0, base = 0; o < outer; o++, base += len) {
+        let s = 0;
+        for (let k = 0; k < len; k++) s += A[base + k];
+        out[o] = mean ? s / len : s;
+      }
+    };
+    return node({ data: out, shape }, [a], (g) => {
+      for (let o = 0, base = 0; o < outer; o++, base += len) ga.fill(mean ? g[o] / len : g[o], base, base + len);
+      return [ga];
+    }, forward, args === undefined ? { op } : { op, args });
+  }
   const forward = () => {
     out.fill(0);
     for (let o = 0; o < outer; o++) {
@@ -532,16 +548,15 @@ function additiveReduce(op, aIn, options, mean) {
         for (let i = 0; i < inner; i++) out[ob + i] += A[row + i];
       }
     }
-    if (mean) for (let i = 0; i < out.length; i++) out[i] *= scale;
+    if (mean) for (let i = 0; i < out.length; i++) out[i] /= len;
   };
-  const ga = new Float64Array(A.length);
   return node({ data: out, shape }, [a], (g) => {
     for (let o = 0; o < outer; o++) {
       const base = o * len * inner;
       const ob = o * inner;
       for (let k = 0; k < len; k++) {
         const row = base + k * inner;
-        for (let i = 0; i < inner; i++) ga[row + i] = g[ob + i] * scale;
+        for (let i = 0; i < inner; i++) ga[row + i] = mean ? g[ob + i] / len : g[ob + i];
       }
     }
     return [ga];
@@ -732,13 +747,49 @@ export function matmul(aIn, bIn) {
       for (let j = 0; j < n; j++) gb[bp + j] = gbt[j * k + p];
     }
   };
-  const forward = () => {
+  // One block — every unbatched product, the GLM's X·β included — gets
+  // kernels without offsets: on a skinny X the per-row offset arithmetic
+  // showed up as 5–10%.
+  const forwardOne = () => {
+    out.fill(0);
+    for (let i = 0; i < M; i++) {
+      for (let p = 0; p < k; p++) {
+        const aip = A[i * k + p];
+        if (aip === 0) continue;
+        for (let j = 0; j < n; j++) out[i * n + j] += aip * B[p * n + j];
+      }
+    }
+  };
+  const backwardOne = (g) => {
+    for (let p = 0; p < k; p++) {
+      for (let j = 0; j < n; j++) Bt[j * k + p] = B[p * n + j];
+    }
+    ga.fill(0);
+    gbt.fill(0);
+    for (let i = 0; i < M; i++) {
+      const ai = i * k;
+      for (let j = 0; j < n; j++) {
+        const gij = g[i * n + j];
+        if (gij === 0) continue;
+        const bj = j * k;
+        for (let p = 0; p < k; p++) {
+          ga[ai + p] += gij * Bt[bj + p];
+          gbt[bj + p] += A[ai + p] * gij;
+        }
+      }
+    }
+    for (let p = 0; p < k; p++) {
+      for (let j = 0; j < n; j++) gb[p * n + j] = gbt[j * k + p];
+    }
+  };
+  const forward = blocks === 1 ? forwardOne : () => {
     for (let t = 0; t < blocks; t++) forwardBlock(t * M * n, t * M * k, batched ? t * k * n : 0);
   };
 
   const shape = vectorRhs ? [...lead, m] : [...lead, m, n];
   return node({ data: out, shape }, [a, b], (g) => {
-    for (let t = 0; t < blocks; t++) backwardBlock(g, t * M * n, t * M * k, batched ? t * k * n : 0);
+    if (blocks === 1) backwardOne(g);
+    else for (let t = 0; t < blocks; t++) backwardBlock(g, t * M * n, t * M * k, batched ? t * k * n : 0);
     return [ga, gb];
   }, forward, { op: 'matmul' });
 }
@@ -796,11 +847,11 @@ export function transpose(aIn, perm) {
   }
   const own = stridesOf(a.shape);
   const shape = p.map((k) => a.shape[k]);
-  const strides = p.map((k) => own[k]);
+  const walk = simplify(shape, p.map((k) => own[k]));
   const src = a.value.data;
   const out = new Float64Array(src.length);
-  const forward = () => copyStrided(out, src, shape, strides, 0);
-  return node({ data: out, shape }, [a], (g) => [(into) => addStrided(into, g, shape, strides, 0)],
+  const forward = () => copyStrided(out, src, walk.shape, walk.strides, 0);
+  return node({ data: out, shape }, [a], (g) => [(into) => addStrided(into, g, walk.shape, walk.strides, 0)],
     forward, perm === undefined ? { op: 'transpose' } : { op: 'transpose', args: [p.slice()] });
 }
 
@@ -947,10 +998,11 @@ export function slice(aIn, start, size) {
   let base = 0;
   for (let d = 0; d < rank; d++) base += start[d] * strides[d];
   const shape = size.slice();
+  const walk = simplify(shape, strides);
   const src = a.value.data;
   const out = new Float64Array(sizeOf(shape));
-  const forward = () => copyStrided(out, src, shape, strides, base);
-  return node({ data: out, shape }, [a], (g) => [(into) => addStrided(into, g, shape, strides, base)],
+  const forward = () => copyStrided(out, src, walk.shape, walk.strides, base);
+  return node({ data: out, shape }, [a], (g) => [(into) => addStrided(into, g, walk.shape, walk.strides, base)],
     forward, { op: 'slice', args: [start.slice(), size.slice()] });
 }
 
