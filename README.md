@@ -68,9 +68,12 @@ add on top of the language's limit is nesting, and that part is avoidable:
 is one call rather than four wrapped ones. The graph is identical either way.
 `sub` and `div` stay binary, since `sub(a, b, c)` reads ambiguously.
 
-**Rank capped at 2.** Scalars, vectors, matrices. Every model in the suite is
-expressed in those; rank-N would cost broadcasting complexity in every adjoint
-for no consumer.
+**Rank capped at 3.** Scalars, vectors and matrices carry every statistical
+model in the suite, and the linear algebra stays there. Rank 3 exists for one
+consumer: a batch of sequences, `[n, T, F]`, which a recurrent network slices
+one time step at a time. The structural ops (`reshape`, `slice`, `concat`,
+`gather`, the reductions) and the elementwise ops accept it; rank-N would
+cost broadcasting complexity in every adjoint for no consumer.
 
 Forward factorizations come from [`@tangent.to/lina`](https://github.com/tangent-to/lina),
 which is scipy-validated.
@@ -267,11 +270,12 @@ what a wide Jacobian would want.
 | `valueAndGradFns(f, opts)` | the `(fn, gradFn)` pair mc's `potential` takes |
 | `add` `mul` | elementwise, and variadic: `add(a, b, c, d)` |
 | `sub` `div` `neg` | the same, strictly binary |
-| | binary ops broadcast a scalar against anything, and a vector against the rows of a matrix: `add(matmul(X, W), b)` |
+| | binary ops broadcast a scalar against anything; a vector along the last axis of a matrix or rank-3 tensor, `add(matmul(X, W), b)`; and an `[n, 1]` column across an `[n, d]` matrix, `mul(mask, h)` |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
-| `sum` `mean` | reductions to a scalar |
-| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation; `concat(parts, { axis })` joins matrices by rows or by columns |
+| `sum` `mean` `max` | reductions to a scalar, or along one axis with `{ axis, keepDims }`: `max(Z, { axis: 1, keepDims: true })` is `[n, 1]`. `max` sends its adjoint to the first winner |
+| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation; `reshape`, `slice` and `concat(parts, { axis })` work up to rank 3, so one time step of `[n, T, F]` is `slice(x, [0, t, 0], [n, 1, F])` |
+| `gather(table, index)` | rows of a table by integer index, shaped as the index followed by a row: an embedding lookup, or a hierarchical model's `z[site]`. The index may be an input that changes per call |
 | `cholesky` `triangularSolve` `logdetPSD` `solvePSD` | differentiable linear algebra, symmetric positive definite |
 | `solveGeneral` `inv` | the same for a general square matrix (LU) |
 | `jacobian(f)` | ∂f/∂x for a vector-valued f |

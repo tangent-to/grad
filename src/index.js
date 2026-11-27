@@ -18,8 +18,8 @@ export { asTensor, isTensor, toNested, tensor, zeros, eye } from './tensor.js';
 export {
   add, sub, mul, div, neg,
   exp, log, sqrt, square, pow, tanh, sigmoid, maximum, minimum, relu, lgamma,
-  sum, mean,
-  matmul, dot, transpose, diagPart, trace, addDiag, reshape, slice, concat,
+  sum, mean, max,
+  matmul, dot, transpose, diagPart, trace, addDiag, reshape, slice, concat, gather,
 } from './ops.js';
 export { cholesky, triangularSolve, logdetPSD, solvePSD, solveGeneral, inv } from './linalg.js';
 export { grad, valueAndGrad, valueAndGradFns, splitValueAndGrad, compile, compileFromJSON, jacobian } from './api.js';
