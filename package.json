@@ -22,6 +22,7 @@
     "prepare": "npm run build:browser",
     "test": "vitest",
     "test:run": "vitest run",
+    "references": "python3 tests/references/nd_reference.py && Rscript tests/references/nd_reference.R",
     "build:browser": "esbuild src/index.js --bundle --platform=browser --format=esm --target=es2020 --outfile=dist/index.js --sourcemap --minify --keep-names --external:@tangent.to/*",
     "jsr:publish": "deno publish --allow-dirty",
     "jsr:publish:dry-run": "deno publish --dry-run --allow-dirty",

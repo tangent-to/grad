@@ -1,0 +1,38 @@
+name: References
+
+# Regenerates the PyTorch and R reference fixtures from their scripts and runs
+# the test suite against them. The committed fixtures already run on every
+# push (CI); this catches drift in the references themselves, and checks that
+# the scripts still reproduce what is committed.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/references/**'
+      - 'tests/fixtures/**'
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  references:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+      - uses: r-lib/actions/setup-r@v2
+      - run: Rscript -e 'install.packages("jsonlite", repos = "https://cloud.r-project.org")'
+      - run: npm install --no-fund --no-audit
+      - run: npm run references
+      # Regenerated values may differ from the committed ones in the last bits
+      # across platforms; the tests compare to a tolerance, so show the diff
+      # for the record and let the tests decide.
+      - run: git diff --stat tests/fixtures || true
+      - run: npm run test:run

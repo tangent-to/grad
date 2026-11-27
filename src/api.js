@@ -23,7 +23,7 @@
  */
 
 import { Var, runWithDeferredForward, topoOrder, variable } from './tape.js';
-import { isTensor, sameShape, shapeStr, sizeOf, toNested } from './tensor.js';
+import { isTensor, nestedShape, sameShape, shapeStr, sizeOf, toNested, writeNested } from './tensor.js';
 import * as ops from './ops.js';
 import * as linalg from './linalg.js';
 
@@ -362,17 +362,7 @@ export function jacobian(f) {
 function signatureOf(x) {
   if (typeof x === 'number') return 's';
   if (isTensor(x)) return shapeSig(x.shape);
-  if (Array.isArray(x) || x instanceof Float64Array) {
-    const first = x[0];
-    if (Array.isArray(first) || first instanceof Float64Array) {
-      const inner = first[0];
-      if (Array.isArray(inner) || inner instanceof Float64Array) {
-        return `${x.length}x${first.length}x${inner.length}`;
-      }
-      return `${x.length}x${first.length}`;
-    }
-    return `v${x.length}`;
-  }
+  if (Array.isArray(x) || x instanceof Float64Array) return shapeSig(nestedShape(x));
   return Object.keys(x).sort().map((k) => `${k}:${signatureOf(x[k])}`).join(',');
 }
 
@@ -392,24 +382,8 @@ function writeLeaf(leaf, v) {
     d.set(v.data);
     return;
   }
-  const first = v[0];
-  if (Array.isArray(first) && first.length > 0 && (Array.isArray(first[0]) || first[0] instanceof Float64Array)) {
-    let o = 0;
-    for (let i = 0; i < v.length; i++) {
-      const mat = v[i];
-      for (let j = 0; j < mat.length; j++) {
-        const row = mat[j];
-        for (let k = 0; k < row.length; k++) d[o++] = row[k];
-      }
-    }
-    return;
-  }
-  if (Array.isArray(first) || first instanceof Float64Array) {
-    let o = 0;
-    for (let i = 0; i < v.length; i++) {
-      const row = v[i];
-      for (let j = 0; j < row.length; j++) d[o++] = row[j];
-    }
+  if (typeof v[0] !== 'number' && !(v instanceof Float64Array)) {
+    writeNested(d, v);
     return;
   }
   for (let i = 0; i < v.length; i++) d[i] = v[i];

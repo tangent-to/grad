@@ -10,17 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Rank-3 tensors**, for a batch of sequences `[n, T, F]`. Nested
-  `[n][T][F]` arrays are read and written like rows; plans are keyed by the
-  full shape. `reshape` accepts targets up to rank 3; `slice` takes windows of
-  rank-3 tensors, one time step being `slice(x, [0, t, 0], [n, 1, F])`; and
-  `concat` joins rank-3 parts along any axis, axis 1 stacking per-step states
-  back into a sequence. The elementwise ops accept rank 3 unchanged.
-- **Column broadcasting.** The binary elementwise ops accept an `[n, d]`
-  operand with an `[n, 1]` operand on either side, one weight per row: a
-  padding mask applied to a recurrent state. The column's adjoint is the row
-  sum. Row broadcasting of a `[d]` vector now also reaches the last axis of a
-  rank-3 tensor, a bias added at every time step.
+- **Tensors of any rank.** Nested arrays of any depth are read and written
+  like rows, and plans are keyed by the full shape. The elementwise ops,
+  `reshape`, `slice`, `concat` (along any axis), the reductions and `gather`
+  accept any rank; one time step of a batch of sequences `[n, T, F]` is
+  `slice(x, [0, t, 0], [n, 1, F])`, and `concat` along axis 1 stacks
+  per-step states back into a sequence.
+- **numpy broadcasting.** The binary elementwise ops align shapes from the
+  right and repeat length-1 or missing axes: a bias `[d]` on `[n, T, d]`, a
+  per-row weight `[n, 1]` on `[n, d]`, a mask `[n, 1, T]` on `[n, T, T]`. The
+  adjoint sums back over the repeated axes. Unlike numpy, the result must be
+  one operand's shape: `[n]` against `[n, 1]` is refused instead of becoming
+  an `[n, n]` table, the shape a residual meeting an observation by mistake
+  takes.
+- **`transpose(x, perm)`** permutes any number of axes; without `perm` it
+  reverses them, which for a matrix is the transpose as before.
+- **Batched `matmul`.** The product runs over the last two axes:
+  `[..., m, k] · [k, n]` applies one matrix to every leading index (a weight
+  matrix to every time step) as a single product, and
+  `[..., m, k] · [..., k, n]` multiplies block by block.
 - **Axis reductions.** `sum`, `mean` and the new `max` take
   `{ axis, keepDims }`; with `keepDims` the reduced axis stays at length 1 and
   broadcasts back, which is what a stable softmax or log-sum-exp needs.
@@ -63,9 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluated, there being several.
 
 ### Fixed
-- A plan for a rank-3 argument no longer shares a cache key with a matrix of
-  the same leading shape; before, `[2, 3, 4]` and `[2, 3]` both signed as
-  `2x3` and the second replayed the first's graph.
+- A plan for an argument of rank 3 or more no longer shares a cache key
+  with a matrix of the same leading shape; before, `[2, 3, 4]` and `[2, 3]`
+  both signed as `2x3` and the second replayed the first's graph.
+
+### Validation
+- The n-dimensional ops are checked against PyTorch (values and autograd
+  gradients) and base R (values), in float64, on 102 cases with asymmetric
+  shapes; the fixtures are committed and `npm run references` regenerates
+  them. A scheduled workflow reruns the references themselves.
 - `slice` no longer allocates and accumulates a gradient buffer the size of
   its whole parent: its adjoint adds into the touched entries only. A
   recurrent network slicing T steps from one batch paid O(T²) for that in the
