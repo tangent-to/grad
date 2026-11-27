@@ -163,10 +163,28 @@ export function variable(x, name = 'value') {
  *   name and static arguments, so a plan can be serialized and rebuilt.
  * @returns {Var}
  */
+let deferInitialForward = false;
+
+/**
+ * Defer each op's initial forward pass inside `fn`, so a serialized plan can
+ * be reconstructed before real parameters and inputs are supplied.
+ * @param {() => any} fn
+ */
+export function runWithDeferredForward(fn) {
+  const prev = deferInitialForward;
+  deferInitialForward = true;
+  try {
+    return fn();
+  } finally {
+    deferInitialForward = prev;
+  }
+}
+
 export function node(value, parents, backward, recompute = null, spec = null) {
   if (value.data.length !== sizeOf(value.shape)) {
     throw new Error(`op produced ${value.data.length} elements for shape ${shapeStr(value.shape)}`);
   }
+  if (!deferInitialForward && recompute !== null) recompute();
   return new Var(value, parents, backward, recompute, spec);
 }
 

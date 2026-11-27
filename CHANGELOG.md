@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluated, there being several.
 
 ### Fixed
+- `compileFromJSON` defers op evaluation until the restored plan receives real
+  parameters and inputs, so domain-sensitive ops such as `cholesky` and
+  `solveGeneral` succeed on serialized positive-definite matrix objectives.
 - The shared value and gradient cache compares matrix entries and tensor
   shapes by value, including after in-place parameter edits.
 - The zero gradient reported for a matrix parameter the objective never reads

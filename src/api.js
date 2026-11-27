@@ -22,7 +22,7 @@
  * constants.
  */
 
-import { Var, topoOrder, variable } from './tape.js';
+import { Var, runWithDeferredForward, topoOrder, variable } from './tape.js';
 import { isTensor, sameShape, shapeStr, sizeOf, toNested } from './tensor.js';
 import * as ops from './ops.js';
 import * as linalg from './linalg.js';
@@ -671,31 +671,33 @@ export function compileFromJSON(json) {
   const sigParts = [];
   const inputParts = [];
 
-  json.nodes.forEach((n, i) => {
-    if (n.kind === 'param') {
-      const v = variable({ data: new Float64Array(sizeOf(n.shape)), shape: n.shape.slice() });
-      vars[i] = v;
-      if (isMap) {
-        leaves[n.name] = v;
-        sigParts.push([n.name, shapeSig(n.shape)]);
+  runWithDeferredForward(() => {
+    json.nodes.forEach((n, i) => {
+      if (n.kind === 'param') {
+        const v = variable({ data: new Float64Array(sizeOf(n.shape)), shape: n.shape.slice() });
+        vars[i] = v;
+        if (isMap) {
+          leaves[n.name] = v;
+          sigParts.push([n.name, shapeSig(n.shape)]);
+        } else {
+          single = v;
+          sigParts.push(['', shapeSig(n.shape)]);
+        }
+      } else if (n.kind === 'input') {
+        const v = variable({ data: new Float64Array(sizeOf(n.shape)), shape: n.shape.slice() });
+        vars[i] = v;
+        if (inputs === null) inputs = {};
+        inputs[n.name] = v;
+        inputParts.push([n.name, shapeSig(n.shape)]);
+      } else if (n.kind === 'const') {
+        vars[i] = variable({ data: Float64Array.from(n.data), shape: n.shape.slice() });
       } else {
-        single = v;
-        sigParts.push(['', shapeSig(n.shape)]);
+        const fn = REGISTRY[n.op];
+        if (!fn) throw new Error(`compileFromJSON: unknown op "${n.op}"`);
+        const parents = n.parents.map((p) => vars[p]);
+        vars[i] = n.list ? fn(parents, ...(n.args ?? [])) : fn(...parents, ...(n.args ?? []));
       }
-    } else if (n.kind === 'input') {
-      const v = variable({ data: new Float64Array(sizeOf(n.shape)), shape: n.shape.slice() });
-      vars[i] = v;
-      if (inputs === null) inputs = {};
-      inputs[n.name] = v;
-      inputParts.push([n.name, shapeSig(n.shape)]);
-    } else if (n.kind === 'const') {
-      vars[i] = variable({ data: Float64Array.from(n.data), shape: n.shape.slice() });
-    } else {
-      const fn = REGISTRY[n.op];
-      if (!fn) throw new Error(`compileFromJSON: unknown op "${n.op}"`);
-      const parents = n.parents.map((p) => vars[p]);
-      vars[i] = n.list ? fn(parents, ...(n.args ?? [])) : fn(...parents, ...(n.args ?? []));
-    }
+    });
   });
 
   const root = vars[json.root];

@@ -123,6 +123,18 @@ describe('serialize: linear algebra', () => {
       sum(square(triangularSolve(transpose(cholesky(spd(p))), p.rhs, { lower: false }))),
   };
   for (const [name, f] of Object.entries(cases)) it(name, () => roundTrips(f, points));
+
+  it('round-trips a bare positive-definite matrix objective without evaluating on zero leaves', () => {
+    const A1 = [[4, 1], [1, 3]];
+    const A2 = [[5, -1.5], [-1.5, 2]];
+    roundTrips((A) => logdetPSD(A), [A1, A2]);
+    roundTrips((p) => sum(square(cholesky(p.A))), [{ A: A1 }, { A: A2 }]);
+    roundTrips((p) => sum(solvePSD(p.A, p.b)), [
+      { A: A1, b: [1, 2] },
+      { A: A2, b: [-2, 0.5] },
+    ]);
+    roundTrips((p) => sum(inv(p.A)), [{ A: A1 }, { A: A2 }]);
+  });
 });
 
 describe('serialize: realistic objectives', () => {

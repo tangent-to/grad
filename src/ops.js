@@ -125,7 +125,6 @@ function binary(op, fwd, bwd) {
       if (rowB) tile(B, b.value.data);
       fwd(out, A, B, sa, sb, n);
     };
-    forward();
 
     // Allocated once, refilled on every reverse pass. `backward()` accumulates a
     // node's contributions into its parents before touching the next node, so
@@ -162,7 +161,6 @@ function unary(op, fwd, bwd, args = undefined) {
     const A = a.value.data;
     const out = new Float64Array(n);
     const forward = () => fwd(out, A, n);
-    forward();
     const ga = new Float64Array(n);
     return node({ data: out, shape: a.shape.slice() }, [a], (g) => {
       bwd(g, ga, A, out, n);
@@ -473,7 +471,6 @@ export function sum(aIn) {
     for (let i = 0; i < n; i++) s += a.value.data[i];
     out[0] = s;
   };
-  forward();
   const ga = new Float64Array(n);
   return node({ data: out, shape: [] }, [a], (g) => {
     ga.fill(g[0]);
@@ -495,7 +492,6 @@ export function mean(aIn) {
     for (let i = 0; i < n; i++) s += a.value.data[i];
     out[0] = s / n;
   };
-  forward();
   const ga = new Float64Array(n);
   return node({ data: out, shape: [] }, [a], (g) => {
     ga.fill(g[0] / n);
@@ -543,7 +539,6 @@ export function matmul(aIn, bIn) {
       }
     }
   };
-  forward();
 
   const shape = vectorRhs ? [m] : [m, n];
   const ga = new Float64Array(m * k);
@@ -585,7 +580,6 @@ export function dot(uIn, vIn) {
     for (let i = 0; i < n; i++) s += u.value.data[i] * v.value.data[i];
     out[0] = s;
   };
-  forward();
   const gu = new Float64Array(n);
   const gv = new Float64Array(n);
   return node({ data: out, shape: [] }, [u, v], (g) => {
@@ -612,7 +606,6 @@ export function transpose(aIn) {
   const forward = () => {
     for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) out[j * m + i] = a.value.data[i * n + j];
   };
-  forward();
   const ga = new Float64Array(m * n);
   return node({ data: out, shape: [n, m] }, [a], (g) => {
     for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) ga[i * n + j] = g[j * m + i];
@@ -635,7 +628,6 @@ export function diagPart(aIn) {
   const forward = () => {
     for (let i = 0; i < n; i++) out[i] = a.value.data[i * n + i];
   };
-  forward();
   const ga = new Float64Array(n * n);
   return node({ data: out, shape: [n] }, [a], (g) => {
     for (let i = 0; i < n; i++) ga[i * n + i] = g[i];
@@ -680,7 +672,6 @@ export function addDiag(aIn, alphaIn) {
     out.set(a.value.data);
     for (let i = 0; i < n; i++) out[i * n + i] += perRow ? alpha.value.data[i] : alpha.value.data[0];
   };
-  forward();
 
   const gAlpha = new Float64Array(perRow ? n : 1);
   return node({ data: out, shape: [n, n] }, [a, alpha], (g) => {
@@ -719,7 +710,6 @@ export function reshape(aIn, shape) {
   }
   const out = new Float64Array(a.value.data.length);
   const forward = () => out.set(a.value.data);
-  forward();
   return node({ data: out, shape: shape.slice() }, [a], (g) => [g.slice()], forward, { op: 'reshape', args: [shape.slice()] });
 }
 
@@ -759,7 +749,6 @@ export function slice(aIn, start, size) {
     const [n0] = size;
     const out = new Float64Array(n0);
     const forward = () => out.set(src.subarray(s0, s0 + n0));
-    forward();
     const ga = new Float64Array(src.length);
     return node({ data: out, shape: [n0] }, [a], (g) => {
       ga.fill(0);
@@ -776,7 +765,6 @@ export function slice(aIn, start, size) {
       for (let j = 0; j < n0; j++) out[i * n0 + j] = src[(s0 + i) * n + (s1 + j)];
     }
   };
-  forward();
   const ga = new Float64Array(m * n);
   return node({ data: out, shape: [m0, n0] }, [a], (g) => {
     ga.fill(0);
@@ -819,7 +807,6 @@ export function concat(parts, options = {}) {
       off += v.value.data.length;
     }
   };
-  forward();
   return node({ data: out, shape: [total] }, vars, (g) => {
     const contribs = [];
     let o = 0;
@@ -856,7 +843,6 @@ function concatMatrices(vars, axis) {
         off += v.value.data.length;
       }
     };
-    forward();
     return node({ data: out, shape: [rows, cols] }, vars, (g) => {
       const contribs = [];
       let o = 0;
@@ -880,7 +866,6 @@ function concatMatrices(vars, axis) {
       off += w;
     }
   };
-  forward();
   const bufs = widths.map((w) => new Float64Array(rows * w));
   return node({ data: out, shape: [rows, cols] }, vars, (g) => {
     let off = 0;

@@ -84,7 +84,6 @@ export function cholesky(aIn) {
     L.fill(0); // the upper triangle stays zero, and a replay must not inherit it
     for (let i = 0; i < n; i++) for (let j = 0; j <= i; j++) L[i * n + j] = Lnested[i][j];
   };
-  forward();
 
   return node({ data: L, shape: [n, n] }, [a], (gL) => {
     // P = Φ(Lᵀ L̄): lower triangle of LᵀL̄, diagonal halved.
@@ -144,7 +143,6 @@ export function triangularSolve(tIn, bIn, opts = {}) {
   const forward = () => {
     X.set(lower ? lowerSolve(T, b.value.data, n, k) : upperSolve(T, b.value.data, n, k));
   };
-  forward();
 
   return node({ data: X, shape: vectorRhs ? [n] : [n, k] }, [t, b], (gX) => {
     // With X = T⁻¹B:  B̄ = T⁻ᵀ X̄  and  T̄ = −B̄ Xᵀ, kept to T's own triangle.
@@ -237,7 +235,6 @@ export function solveGeneral(aIn, bIn) {
     X.set(vectorRhs ? Float64Array.from(Xn) : flattenNested(Xn, n, k));
     At = toNestedFlat(transposeFlat(a.value.data, n), n, n);
   };
-  forward();
 
   return node({ data: X, shape: vectorRhs ? [n] : [n, k] }, [a, b], (gX) => {
     const rhs = vectorRhs ? Array.from(gX) : toNestedFlat(gX, n, k);
