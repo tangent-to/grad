@@ -71,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluated, there being several.
 
 ### Fixed
+- A compiled plan checks the shape of nested arrays as it writes them. The
+  plan is chosen by the first entry at each level, and the write trusted it,
+  so a ragged later row (`[[1, 2], [3]]` after `[[1, 2], [3, 4]]`) silently
+  reused the previous call's values; it now throws, naming the parameter or
+  input and the row. This dates from 0.3's matrices.
+- `valueAndGradFns`'s cache copies parameters at every depth. It copied two
+  levels, so editing a rank-3 parameter in place changed the cached copy too
+  and returned the old value and gradient.
 - A plan for an argument of rank 3 or more no longer shares a cache key
   with a matrix of the same leading shape; before, `[2, 3, 4]` and `[2, 3]`
   both signed as `2x3` and the second replayed the first's graph.

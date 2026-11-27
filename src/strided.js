@@ -33,6 +33,34 @@ export function stridesOf(shape) {
 }
 
 /**
+ * The same walk with fewer, longer rows: length-1 axes dropped (their index
+ * is always 0, so their stride never matters), then each pair of adjacent
+ * axes merged where the outer stride is the inner stride times the inner
+ * length, which is exactly when the two read as one axis. A `[1]` bias
+ * broadcast over a `[256, 1]` column becomes one fill of 256 instead of 256
+ * fills of 1. Called once when a node is built, not on every pass.
+ * @param {number[]} shape
+ * @param {number[]} strides
+ * @returns {{ shape: number[], strides: number[] }}
+ */
+export function simplify(shape, strides) {
+  const sh = [];
+  const st = [];
+  for (let k = 0; k < shape.length; k++) {
+    if (shape[k] === 1) continue;
+    const last = sh.length - 1;
+    if (last >= 0 && st[last] === strides[k] * shape[k]) {
+      sh[last] *= shape[k];
+      st[last] = strides[k];
+    } else {
+      sh.push(shape[k]);
+      st.push(strides[k]);
+    }
+  }
+  return { shape: sh, strides: st };
+}
+
+/**
  * Fill contiguous `dst`, of shape `shape`, from `src` read at
  * `base + Σ idx[k]·strides[k]`.
  * @param {Float64Array} dst

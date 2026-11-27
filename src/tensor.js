@@ -137,7 +137,7 @@ export function asTensor(x, name = 'value') {
   if (shape.length > 2) {
     if (shape.includes(0)) throw new Error(`${name} has an empty axis: ${shapeStr(shape)}`);
     const data = new Float64Array(sizeOf(shape));
-    fillNested(data, x, shape, name);
+    writeNested(data, x, shape, name);
     return { data, shape };
   }
   throw new Error(`${name} must be a number, an array of numbers, or nested arrays of numbers`);
@@ -164,47 +164,92 @@ export function nestedShape(x) {
 
 /**
  * Write nested arrays into flat row-major storage, checking that every level
- * has the length `shape` says. @private
+ * has the length `shape` says. The position of a mismatch is only spelled
+ * out when there is one, since a compiled plan calls this on every batch.
+ * Every entry is also checked to be a number when `checkNumbers` is set, as
+ * `asTensor` does. A compiled plan's replay checks the structure only: the
+ * per-entry test cost 8% of a small regression's step, and a non-number
+ * there is coerced as it always was.
+ *
+ * @param {Float64Array} data - `sizeOf(shape)` long
+ * @param {Array} x
+ * @param {number[]} shape
+ * @param {string} name - for the error message
+ * @param {boolean} [checkNumbers=true]
  */
-function fillNested(data, x, shape, name) {
-  let o = 0;
-  const walk = (v, depth, path) => {
-    const want = shape[depth];
-    if (!isRow(v) || v.length !== want) {
-      throw new Error(
-        `${name} is not rectangular (${path || 'the top level'} has length ${isRow(v) ? v.length : 0}, expected ${want})`,
-      );
+export function writeNested(data, x, shape, name, checkNumbers = true) {
+  // Ranks 2 and 3 are the mini-batch case, written on every training step:
+  // plain loops, no recursion, and a position only computed on failure.
+  if (shape.length === 2) {
+    const [m, n] = shape;
+    if (!isRow(x) || x.length !== m) throw notRectangular(name, x, [], m);
+    let o = 0;
+    for (let i = 0; i < m; i++) {
+      const row = x[i];
+      if (!isRow(row) || row.length !== n) throw notRectangular(name, row, [i], n);
+      if (checkNumbers) {
+        for (let j = 0; j < n; j++) {
+          const e = row[j];
+          if (typeof e !== 'number') throw notNumber(name, [i, j]);
+          data[o++] = e;
+        }
+      } else {
+        for (let j = 0; j < n; j++) data[o++] = row[j];
+      }
     }
-    if (depth === shape.length - 1) {
+    return;
+  }
+  if (shape.length === 3) {
+    const [b, m, n] = shape;
+    if (!isRow(x) || x.length !== b) throw notRectangular(name, x, [], b);
+    let o = 0;
+    for (let k = 0; k < b; k++) {
+      const mat = x[k];
+      if (!isRow(mat) || mat.length !== m) throw notRectangular(name, mat, [k], m);
+      for (let i = 0; i < m; i++) {
+        const row = mat[i];
+        if (!isRow(row) || row.length !== n) throw notRectangular(name, row, [k, i], n);
+        if (checkNumbers) {
+          for (let j = 0; j < n; j++) {
+            const e = row[j];
+            if (typeof e !== 'number') throw notNumber(name, [k, i, j]);
+            data[o++] = e;
+          }
+        } else {
+          for (let j = 0; j < n; j++) data[o++] = row[j];
+        }
+      }
+    }
+    return;
+  }
+  const last = shape.length - 1;
+  const at = new Array(shape.length).fill(0);
+  let o = 0;
+  const walk = (v, depth) => {
+    const want = shape[depth];
+    if (!isRow(v) || v.length !== want) throw notRectangular(name, v, at.slice(0, depth), want);
+    if (depth === last) {
       for (let k = 0; k < want; k++) {
-        if (typeof v[k] !== 'number') throw new Error(`${name}${path}[${k}] is not a number`);
-        data[o++] = v[k];
+        const e = v[k];
+        if (checkNumbers && typeof e !== 'number') throw notNumber(name, [...at.slice(0, depth), k]);
+        data[o++] = e;
       }
       return;
     }
-    for (let k = 0; k < want; k++) walk(v[k], depth + 1, `${path}[${k}]`);
+    for (let k = 0; k < want; k++) {
+      at[depth] = k;
+      walk(v[k], depth + 1);
+    }
   };
-  walk(x, 0, '');
+  walk(x, 0);
 }
 
-/**
- * Write nested arrays of a known shape into existing flat storage, without
- * checks: the caller has already matched the shape. What a compiled plan
- * uses to write a new value into a leaf.
- * @param {Float64Array} data
- * @param {Array} x
- */
-export function writeNested(data, x) {
-  let o = 0;
-  const walk = (v) => {
-    if (typeof v[0] === 'number') {
-      for (let k = 0; k < v.length; k++) data[o++] = v[k];
-      return;
-    }
-    for (let k = 0; k < v.length; k++) walk(v[k]);
-  };
-  walk(x);
+const pathOf = (at) => at.map((k) => `[${k}]`).join('');
+function notRectangular(name, v, at, want) {
+  const len = isRow(v) ? v.length : 0;
+  return new Error(`${name} is not rectangular (${pathOf(at) || 'the top level'} has length ${len}, expected ${want})`);
 }
+const notNumber = (name, at) => new Error(`${name}${pathOf(at)} is not a number`);
 
 /**
  * Convert a tensor back to the boundary currency: a number for rank 0, a flat

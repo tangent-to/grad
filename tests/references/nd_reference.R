@@ -65,6 +65,10 @@ run <- function(c) {
     d <- dims(a)
     k <- args$axis + 1L
     keep <- setdiff(seq_along(d), k)
+    if (length(keep) == 0) {
+      # A vector reduced along its only axis: a scalar, or [1] with keepDims.
+      return(if (isTRUE(args$keepDims)) fromR(array(f(a), dim = 1L)) else fromR(f(a), scalar = TRUE))
+    }
     y <- apply(a, keep, f)
     nd <- if (isTRUE(args$keepDims)) replace(d, k, 1L) else d[keep]
     return(fromR(array(y, dim = nd)))
@@ -120,11 +124,13 @@ run <- function(c) {
     return(list(shape = as.integer(unlist(args$shape)), data = fromR(a)$data))
   }
   if (op == "gather") {
-    ix <- fromR(toR(c$inputs$index))
-    rows <- as.integer(ix$data) + 1L
+    # The index is already row-major data; its shape may be [] (one row).
+    ishape <- as.integer(unlist(c$inputs$index$shape))
+    rows <- as.integer(unlist(c$inputs$index$data)) + 1L
     rest <- dims(a)[-1]
+    if (length(dim(a)) <= 1) rest <- integer(0)
     picked <- if (length(rest)) index_all(a, c(list(rows), lapply(rest, function(n) TRUE))) else a[rows]
-    return(list(shape = c(ix$shape, rest), data = fromR(picked)$data))
+    return(list(shape = c(ishape, rest), data = fromR(picked)$data))
   }
   stop(paste("unknown op", op))
 }

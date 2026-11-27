@@ -92,6 +92,79 @@ case("gather matrix rows, repeated", "gather",
      {"a": values([4, 3]), "index": np.array([3, 0, 3], dtype=np.float64)}, nondiff=["index"])
 
 
+# Randomized cases: shapes, partners, axes and permutations drawn from a fixed
+# seed, so the fixture is reproducible and covers combinations nobody chose.
+fz = np.random.default_rng(7)
+
+
+def rshape(rank):
+    hi = 4 if rank <= 3 else 3
+    return [int(fz.integers(1, hi + 1)) for _ in range(rank)]
+
+
+def partner(shape):
+    """A shape that broadcasts one-sidedly into `shape`: leading axes dropped,
+    some axes set to 1, sometimes a scalar or the same shape."""
+    roll = fz.random()
+    if roll < 0.08:
+        return []
+    if roll < 0.16:
+        return list(shape)
+    drop = int(fz.integers(0, len(shape)))
+    return [1 if fz.random() < 0.4 else d for d in shape[drop:]]
+
+
+for i in range(150):
+    op = ["add", "sub", "mul", "div", "maximum"][int(fz.integers(0, 5))]
+    full = rshape(int(fz.integers(1, 6)))
+    other = partner(full)
+    sa, sb = (full, other) if fz.random() < 0.5 else (other, full)
+    case(f"fuzz {i} {op} {sa} {sb}", op, {"a": values(sa), "b": values(sb, positive=(op == "div"))})
+
+for i in range(60):
+    op = ["sum", "mean", "max"][int(fz.integers(0, 3))]
+    shape = rshape(int(fz.integers(1, 6)))
+    if fz.random() < 0.15:
+        case(f"fuzz {i} {op} {shape} whole", op, {"a": values(shape)})
+    else:
+        axis = int(fz.integers(0, len(shape)))
+        keep = bool(fz.random() < 0.5)
+        case(f"fuzz {i} {op} {shape} axis={axis} keepDims={keep}", op, {"a": values(shape)},
+             {"axis": axis, "keepDims": keep})
+
+for i in range(40):
+    shape = rshape(int(fz.integers(2, 6)))
+    perm = None if fz.random() < 0.15 else [int(k) for k in fz.permutation(len(shape))]
+    case(f"fuzz {i} transpose {shape} perm={perm}", "transpose", {"a": values(shape)}, {"perm": perm})
+
+for i in range(40):
+    lead = rshape(int(fz.integers(0, 3)))
+    m, k, n = (int(fz.integers(1, 5)) for _ in range(3))
+    kind = ["shared", "vector", "batched"][int(fz.integers(0, 3)) if lead else int(fz.integers(0, 2))]
+    sb = [k, n] if kind == "shared" else [k] if kind == "vector" else lead + [k, n]
+    case(f"fuzz {i} matmul {lead + [m, k]} {sb}", "matmul", {"a": values(lead + [m, k]), "b": values(sb)})
+
+for i in range(40):
+    shape = rshape(int(fz.integers(1, 6)))
+    start = [int(fz.integers(0, d)) for d in shape]
+    size = [int(fz.integers(1, d - s0 + 1)) for d, s0 in zip(shape, start)]
+    case(f"fuzz {i} slice {shape} {start} {size}", "slice", {"a": values(shape)}, {"start": start, "size": size})
+
+for i in range(30):
+    shape = rshape(int(fz.integers(2, 6)))
+    axis = int(fz.integers(0, len(shape)))
+    other = list(shape)
+    other[axis] = int(fz.integers(1, 4))
+    case(f"fuzz {i} concat {shape} {other} axis={axis}", "concat", {"a": values(shape), "b": values(other)},
+         {"axis": axis})
+
+for i in range(30):
+    table = rshape(int(fz.integers(1, 4)))
+    ishape = rshape(int(fz.integers(0, 6 - len(table))))
+    index = fz.integers(0, table[0], size=ishape).astype(np.float64)
+    case(f"fuzz {i} gather {table} at {ishape}", "gather", {"a": values(table), "index": index}, nondiff=["index"])
+
+
 def run(c):
     t = {k: torch.tensor(v, requires_grad=k not in c["nondiff"]) for k, v in c["inputs"].items()}
     op, args = c["op"], c["args"]
