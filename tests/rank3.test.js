@@ -11,79 +11,7 @@ import {
   add, asTensor, compile, compileFromJSON, concat, div, exp, gather, log, matmul, max, maximum,
   mean, mul, reshape, slice, square, sub, sum, tanh, toNested, valueAndGrad,
 } from '../src/index.js';
-import { fdGrad } from './_fd.js';
-
-// ---- helpers ---------------------------------------------------------------
-
-/** Deterministic values in (-1, 1). */
-function rng(seed = 3) {
-  let s = seed >>> 0;
-  return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296) * 2 - 1;
-}
-
-/** A nested array of the given shape, filled from `next`. */
-function filled(shape, next) {
-  if (shape.length === 1) return Array.from({ length: shape[0] }, next);
-  return Array.from({ length: shape[0] }, () => filled(shape.slice(1), next));
-}
-
-const flatten = (x) => (Array.isArray(x) ? x.flatMap(flatten) : [x]);
-
-/** Rebuild a nested array shaped like `like` from a flat list. */
-function unflatten(flat, like) {
-  let i = 0;
-  const walk = (l) => (Array.isArray(l) ? l.map(walk) : flat[i++]);
-  return walk(like);
-}
-
-/** Flatten a `{name: nested}` map in key order, and its inverse. */
-function packer(params) {
-  const keys = Object.keys(params);
-  return {
-    pack: (p) => keys.flatMap((k) => flatten(p[k])),
-    unpack: (v) => {
-      const out = {};
-      let o = 0;
-      for (const k of keys) {
-        const n = flatten(params[k]).length;
-        out[k] = unflatten(v.slice(o, o + n), params[k]);
-        o += n;
-      }
-      return out;
-    },
-  };
-}
-
-const rel = (g, r) => Math.abs(g - r) / (1 + Math.abs(r));
-
-/**
- * The three checks every op here must pass. `p1` and `p2` are two points with
- * the same shapes; `feed1`/`feed2` optional inputs.
- */
-function checkOp(f, p1, p2, feed1, feed2) {
-  const { pack, unpack } = packer(p1);
-  const vg = valueAndGrad(f);
-
-  // 1. Adjoint against finite differences, at p1.
-  const got = vg(p1, feed1);
-  const fd = fdGrad((v) => vg.value(unpack(v), feed1), pack(p1));
-  pack(got.gradient).forEach((g, i) => expect(rel(g, fd[i])).toBeLessThan(1e-6));
-
-  // 2. A plan built at p1 and replayed at p2 matches a fresh tape at p2.
-  const c = compile(f);
-  c(p1, feed1);
-  const fresh = vg(p2, feed2);
-  const replay = c(p2, feed2);
-  expect(replay.value).toBeCloseTo(fresh.value, 12);
-  pack(replay.gradient).forEach((g, i) => expect(g).toBeCloseTo(pack(fresh.gradient)[i], 12));
-
-  // 3. Written out, cloned the way postMessage would, and rebuilt.
-  const json = structuredClone(c.toJSON());
-  const rebuilt = compileFromJSON(json)(p2, feed2);
-  expect(rebuilt.value).toBeCloseTo(fresh.value, 12);
-  pack(rebuilt.gradient).forEach((g, i) => expect(g).toBeCloseTo(pack(fresh.gradient)[i], 12));
-  return json;
-}
+import { checkOp, filled, flatten, rng } from './_check.js';
 
 const r = rng();
 const X = filled([2, 3, 4], r); // [n, T, F]
@@ -99,9 +27,9 @@ describe('rank-3 storage', () => {
     expect(toNested(t)).toEqual(X);
   });
 
-  it('refuses ragged blocks and rows', () => {
-    expect(() => asTensor([[[1, 2]], [[1, 2], [3, 4]]])).toThrow(/block 1 has 2 rows, expected 1/);
-    expect(() => asTensor([[[1, 2], [3]]])).toThrow(/block 0, row 1 has length 1, expected 2/);
+  it('refuses ragged blocks and rows, naming where', () => {
+    expect(() => asTensor([[[1, 2]], [[1, 2], [3, 4]]])).toThrow(/\[1\] has length 2, expected 1/);
+    expect(() => asTensor([[[1, 2], [3]]])).toThrow(/\[0\]\[1\] has length 1, expected 2/);
   });
 
   it('hands a rank-3 parameter its gradient back nested', () => {
@@ -131,9 +59,10 @@ describe('reshape on rank 3', () => {
     }
   });
 
-  it('still refuses a size mismatch and rank 4', () => {
+  it('still refuses a size mismatch, and reaches rank 4', () => {
     expect(() => reshape(X, [5, 5])).toThrow(/cannot view 24 elements/);
-    expect(() => reshape(X, [2, 3, 2, 2])).toThrow(/up to 3 positive integers/);
+    expect(() => reshape(X, [2, 0, 12])).toThrow(/positive integers/);
+    expect(reshape(X, [2, 3, 2, 2]).shape).toEqual([2, 3, 2, 2]);
   });
 
   it('differentiates and replays', () => {
@@ -205,9 +134,9 @@ describe('concat on rank 3', () => {
   });
 
   it('refuses parts that disagree off the axis, and mixed ranks', () => {
-    expect(() => concat([X, filled([2, 2, 3], r)], { axis: 1 })).toThrow(/agree on every axis but 1/);
-    expect(() => concat([X, [[1, 2, 3, 4]]])).toThrow(/must all be rank 3/);
-    expect(() => concat([X, X], { axis: 3 })).toThrow(/axis must be 0, 1 or 2/);
+    expect(() => concat([X, filled([2, 2, 3], r)], { axis: 1 })).toThrow(/agree on axis 2/);
+    expect(() => concat([X, [[1, 2, 3, 4]]])).toThrow(/must all be rank-3 tensors/);
+    expect(() => concat([X, X], { axis: 3 })).toThrow(/axis must be an integer from 0 to 2/);
   });
 
   it('differentiates and replays on every axis', () => {
@@ -239,9 +168,9 @@ describe('column broadcast: [n, d] against [n, 1]', () => {
     expect(toNested(next.value)).toEqual([[1, 2, 3], [7, 7, 7]]);
   });
 
-  it('refuses a column of the wrong height and a row-shaped [1, d]', () => {
+  it('refuses a column of the wrong height, and broadcasts a [1, d] row', () => {
     expect(() => mul(H, [[1], [0], [1]])).toThrow(/do not match/);
-    expect(() => mul(H, [[1, 2, 3]])).toThrow(/do not match/);
+    expect(toNested(mul(H, [[1, 0, 2]]).value)).toEqual([[1, 0, 6], [4, 0, 12]]);
   });
 
   it('differentiates and replays through every binary op', () => {
@@ -366,12 +295,11 @@ describe('gather', () => {
     expect(gradient.t).toEqual([[1, 1], [0, 0], [2, 2]]);
   });
 
-  it('refuses a bad index, a scalar table, and a result past rank 3', () => {
+  it('refuses a bad index and a scalar table', () => {
     expect(() => gather(table, [0, 3])).toThrow(/index 3 at position 1 is not a row of a table with 3 rows/);
     expect(() => gather(table, [0.5])).toThrow(/index 0.5/);
     expect(() => gather(table, [-1])).toThrow(/index -1/);
     expect(() => gather(5, [0])).toThrow(/cannot be a scalar/);
-    expect(() => gather(table, [[[0]]])).toThrow(/would have rank 4/);
   });
 
   it('differentiates and replays: a hierarchical z[site]', () => {

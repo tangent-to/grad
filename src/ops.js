@@ -1,19 +1,24 @@
 /**
  * Differentiable operations.
  *
- * Broadcasting is deliberately limited to three cases: a scalar against
- * anything; a vector against the last axis of a matrix or rank-3 tensor
- * (`[n, d]` or `[n, T, d]` with `[d]`); and a column against a matrix
- * (`[n, d]` with `[n, 1]`). Full numpy-style broadcasting would double the
- * size of every adjoint here for cases the suite's models do not use. The
- * scalar case covers a rate against a vector or a penalty against a matrix;
- * the row case is a bias added to every row of `X·W`, and its adjoint is a
- * column sum; the column case is one weight per row — a recurrent network's
- * padding mask applied to its state — and its adjoint is a row sum.
+ * Binary elementwise ops broadcast by numpy's rules: shapes are aligned from
+ * the right, and an axis of length 1, or a missing leading axis, is repeated
+ * to match the other operand. A bias `[d]` added to `X·W` of `[n, d]`, a
+ * per-row weight `[n, 1]` against `[n, d]`, a mask `[n, 1, T]` against
+ * attention scores `[n, T, T]`: each is one call, and its adjoint sums the
+ * gradient back over the axes that were repeated.
+ *
+ * One restriction numpy does not have: the result must have one operand's
+ * shape. `[n]` against `[n, 1]` would broadcast BOTH to an `[n, n]` table,
+ * which is almost always a column of residuals meeting a vector of
+ * observations by mistake, and in a likelihood it is a wrong number rather
+ * than an error. Write the outer product with `matmul`, or reshape one side,
+ * when it is meant.
  */
 
-import { MAX_RANK, sameShape, shapeStr, sizeOf, zeros } from './tensor.js';
-import { node, requireSameShape, toVar } from './tape.js';
+import { sameShape, shapeStr, sizeOf, zeros } from './tensor.js';
+import { node, toVar } from './tape.js';
+import { addStrided, copyStrided, stridesOf } from './strided.js';
 
 /**
  * Fold a gradient contribution back onto a scalar parent that was broadcast:
@@ -28,92 +33,64 @@ function unbroadcastScalar(contrib) {
 }
 
 /**
- * Fold a gradient contribution back onto a vector parent that was spread over
- * the rows of a matrix: each column sums back into its entry. `out` is the
- * parent-sized buffer the op allocated once.
- * @private
- */
-function foldRows(contrib, out) {
-  const d = out.length;
-  out.fill(0);
-  for (let o = 0; o < contrib.length; o += d) {
-    for (let j = 0; j < d; j++) out[j] += contrib[o + j];
-  }
-  return out;
-}
-
-/**
- * Fold a gradient contribution back onto an `[n, 1]` column that was spread
- * across the `d` columns of a matrix: each row sums back into its entry.
- * @private
- */
-function foldCols(contrib, out, d) {
-  for (let i = 0, o = 0; i < out.length; i++, o += d) {
-    let s = 0;
-    for (let j = 0; j < d; j++) s += contrib[o + j];
-    out[i] = s;
-  }
-  return out;
-}
-
-/** Is `v` a vector spread along the last axis of `w`? @private */
-const spreadsAsRow = (v, w) =>
-  v.shape.length === 1 && w.shape.length >= 2 && w.shape[w.shape.length - 1] === v.shape[0];
-
-/** Is `v` an `[n, 1]` column spread across the columns of the `[n, d]` matrix `w`? @private */
-const spreadsAsCol = (v, w) =>
-  v.shape.length === 2 && w.shape.length === 2 && v.shape[1] === 1 && v.shape[0] === w.shape[0];
-
-/**
- * Shape of an elementwise result: a scalar on either side, a vector against
- * the last axis of a matrix or rank-3 tensor, or a column against a matrix.
+ * Shape of an elementwise result under numpy's rules, restricted to results
+ * that are one operand's shape (see the module comment).
  * @private
  */
 function broadcastShape(a, b, op) {
-  if (a.shape.length === 0) return b.shape;
-  if (b.shape.length === 0) return a.shape;
-  if (sameShape(a.shape, b.shape)) return a.shape;
-  if (spreadsAsRow(b, a) || spreadsAsCol(b, a)) return a.shape;
-  if (spreadsAsRow(a, b) || spreadsAsCol(a, b)) return b.shape;
-  requireSameShape(a, b, op);
-  return a.shape;
+  const sa = a.shape;
+  const sb = b.shape;
+  if (sa.length === 0) return sb;
+  if (sb.length === 0) return sa;
+  if (sameShape(sa, sb)) return sa;
+  const rank = Math.max(sa.length, sb.length);
+  const out = new Array(rank);
+  for (let k = 0; k < rank; k++) {
+    const ka = k - (rank - sa.length);
+    const kb = k - (rank - sb.length);
+    const da = ka >= 0 ? sa[ka] : 1;
+    const db = kb >= 0 ? sb[kb] : 1;
+    if (da === db || db === 1) out[k] = da;
+    else if (da === 1) out[k] = db;
+    else {
+      throw new Error(
+        `${op}: shapes ${shapeStr(sa)} and ${shapeStr(sb)} do not match: ` +
+          `aligned from the right, axis ${k} is ${da} against ${db}, and neither is 1`,
+      );
+    }
+  }
+  if (!sameShape(out, sa) && !sameShape(out, sb)) {
+    throw new Error(
+      `${op}: shapes ${shapeStr(sa)} and ${shapeStr(sb)} would both have to be broadcast, ` +
+        `to ${shapeStr(out)}. That is usually a column meeting a vector by mistake; ` +
+        'reshape one operand to the result shape if the outer combination is meant.',
+    );
+  }
+  return out;
 }
 
 /**
- * How an operand is read against the output shape. @private
- * @returns {'same'|'scalar'|'row'|'col'}
+ * Strides that read `v` as if it had the broadcast shape: its own strides,
+ * with 0 on every axis it is repeated along. @private
  */
-function readMode(v, shape) {
-  if (v.shape.length === 0) return 'scalar';
-  if (sameShape(v.shape, shape)) return 'same';
-  return v.shape.length === 1 ? 'row' : 'col';
+function broadcastStrides(vShape, shape) {
+  const own = stridesOf(vShape);
+  const lead = shape.length - vShape.length;
+  return shape.map((d, k) => {
+    const j = k - lead;
+    if (j < 0) return 0;
+    return vShape[j] === 1 && d !== 1 ? 0 : own[j];
+  });
 }
 
 /**
  * Stride for reading an operand elementwise: 0 for a broadcast scalar, which
  * pins every read to element 0, and 1 otherwise. Resolving the broadcast to a
- * stride ONCE lets the kernels below be a single flat loop instead of three
+ * stride ONCE lets the kernels below be a single flat loop instead of
  * variants or a per-element branch.
  * @private
  */
 const strideOf = (v) => (v.shape.length === 0 ? 0 : 1);
-
-/**
- * A vector broadcast along the last axis is read through a buffer that holds
- * it tiled to the output's size, refilled on every forward pass; a column
- * broadcast across a matrix likewise, each entry repeated along its row. That
- * keeps the kernels to the two strides above instead of teaching each of them
- * a modulo, and it keeps the backward kernels reading the same buffer.
- * @private
- */
-function tile(dst, src) {
-  for (let o = 0; o < dst.length; o += src.length) dst.set(src, o);
-}
-
-/** Repeat each entry of an `[n, 1]` column `d` times. @private */
-function tileCols(dst, src, d) {
-  for (let i = 0, o = 0; i < src.length; i++, o += d) dst.fill(src[i], o, o + d);
-}
 
 /**
  * Build a binary elementwise op from a forward and a backward KERNEL.
@@ -152,22 +129,23 @@ function binary(op, fwd, bwd) {
     const b = toVar(bIn, `${op} right operand`);
     const shape = broadcastShape(a, b, op);
     const n = sizeOf(shape);
-    const d = shape.length === 0 ? 1 : shape[shape.length - 1];
-    // A row- or column-broadcast operand reads through its tiled copy; the
-    // others read their own storage, a scalar at stride 0.
-    const ma = readMode(a, shape);
-    const mb = readMode(b, shape);
-    const tiled = (m) => m === 'row' || m === 'col';
-    const A = tiled(ma) ? new Float64Array(n) : a.value.data;
-    const B = tiled(mb) ? new Float64Array(n) : b.value.data;
+    // An operand repeated along some axis is expanded into a buffer of the
+    // result's size on every forward pass, so the kernels stay single flat
+    // loops; a scalar reads at stride 0 and an operand of the result's shape
+    // reads its own storage, neither paying for a copy.
+    const expands = (v) => v.shape.length > 0 && !sameShape(v.shape, shape);
+    const ea = expands(a);
+    const eb = expands(b);
+    const stA = ea ? broadcastStrides(a.shape, shape) : null;
+    const stB = eb ? broadcastStrides(b.shape, shape) : null;
+    const A = ea ? new Float64Array(n) : a.value.data;
+    const B = eb ? new Float64Array(n) : b.value.data;
     const sa = strideOf(a);
     const sb = strideOf(b);
     const out = new Float64Array(n);
     const forward = () => {
-      if (ma === 'row') tile(A, a.value.data);
-      else if (ma === 'col') tileCols(A, a.value.data, d);
-      if (mb === 'row') tile(B, b.value.data);
-      else if (mb === 'col') tileCols(B, b.value.data, d);
+      if (ea) copyStrided(A, a.value.data, shape, stA, 0);
+      if (eb) copyStrided(B, b.value.data, shape, stB, 0);
       fwd(out, A, B, sa, sb, n);
     };
 
@@ -176,16 +154,19 @@ function binary(op, fwd, bwd) {
     // there is no window in which these could be read stale.
     const ga = new Float64Array(n);
     const gb = new Float64Array(n);
-    const fa = tiled(ma) ? new Float64Array(a.value.data.length) : null;
-    const fb = tiled(mb) ? new Float64Array(b.value.data.length) : null;
-    const fold = (g, m, f) => {
-      if (m === 'row') return foldRows(g, f);
-      if (m === 'col') return foldCols(g, f, d);
-      return m === 'scalar' ? unbroadcastScalar(g) : g;
+    const fa = ea ? new Float64Array(a.value.data.length) : null;
+    const fb = eb ? new Float64Array(b.value.data.length) : null;
+    const fold = (g, v, f, st) => {
+      if (f !== null) {
+        f.fill(0);
+        addStrided(f, g, shape, st, 0);
+        return f;
+      }
+      return v.shape.length === 0 ? unbroadcastScalar(g) : g;
     };
     return node({ data: out, shape: shape.slice() }, [a, b], (g) => {
       bwd(g, ga, gb, A, B, out, sa, sb, n);
-      return [fold(ga, ma, fa), fold(gb, mb, fb)];
+      return [fold(ga, a, fa, stA), fold(gb, b, fb, stB)];
     }, forward, { op });
   };
 }
@@ -650,66 +631,94 @@ export function max(aIn, options) {
 }
 
 /**
- * Matrix product. Accepts matrix × matrix and matrix × vector; a vector on the
- * right is treated as a column, as in numpy.
+ * Matrix product over the last two axes, as in numpy.
  *
- * @param {Var|number[][]} aIn - (m × k)
- * @param {Var|number[][]|number[]} bIn - (k × n) or (k)
- * @returns {Var} (m × n) or (m)
+ * - `[m, k] · [k, n]` is the matrix product; a vector `[k]` on the right is
+ *   a column and gives `[m]`.
+ * - `[..., m, k] · [k, n]` applies one matrix to every leading index: a
+ *   weight matrix against a batch of sequences `[n, T, F] · [F, H]`. Storage
+ *   is row-major, so this is one `(… · m) × k` product, not a loop.
+ * - `[..., m, k] · [..., k, n]` with the same leading axes multiplies block
+ *   by block: attention's `Q · Kᵀ` per sequence.
+ *
+ * @param {Var|number[][]} aIn - (…, m, k)
+ * @param {Var|number[][]|number[]} bIn - (k, n), (k) or (…, k, n)
+ * @returns {Var} (…, m, n), or (…, m) for a vector on the right
  */
 export function matmul(aIn, bIn) {
   const a = toVar(aIn, 'matmul left operand');
   const b = toVar(bIn, 'matmul right operand');
-  if (a.shape.length !== 2) {
-    throw new Error(`matmul: left operand must be a matrix, got ${shapeStr(a.shape)}`);
+  const ra = a.shape.length;
+  const rb = b.shape.length;
+  if (ra < 2) {
+    throw new Error(`matmul: left operand must have at least two axes, got ${shapeStr(a.shape)}`);
   }
-  if (b.shape.length !== 1 && b.shape.length !== 2) {
-    throw new Error(`matmul: right operand must be a matrix or vector, got ${shapeStr(b.shape)}`);
+  if (rb === 0) {
+    throw new Error('matmul: right operand cannot be a scalar; use mul');
   }
-  const [m, k] = a.shape;
-  const vectorRhs = b.shape.length === 1;
-  const k2 = b.shape[0];
-  const n = vectorRhs ? 1 : b.shape[1];
+  const lead = a.shape.slice(0, -2);
+  const [m, k] = a.shape.slice(-2);
+  const batched = rb >= 3;
+  const vectorRhs = rb === 1;
+  const k2 = vectorRhs ? b.shape[0] : b.shape[rb - 2];
+  const n = vectorRhs ? 1 : b.shape[rb - 1];
   if (k !== k2) {
     throw new Error(
       `matmul: inner dimensions disagree — ${shapeStr(a.shape)} against ${shapeStr(b.shape)}`,
     );
   }
+  if (batched && (rb !== ra || !sameShape(b.shape.slice(0, -2), lead))) {
+    throw new Error(
+      `matmul: batch axes disagree — ${shapeStr(a.shape)} against ${shapeStr(b.shape)}; ` +
+        'a batched right operand needs the same leading axes as the left',
+    );
+  }
 
+  // Unbatched, the leading axes fold into the rows: one product of M rows.
+  const blocks = batched ? sizeOf(lead) : 1;
+  const M = batched ? m : sizeOf(lead) * m;
   const A = a.value.data;
   const B = b.value.data;
-  const out = new Float64Array(m * n);
-  const forward = () => {
-    out.fill(0); // the kernel accumulates
-    for (let i = 0; i < m; i++) {
+  const out = new Float64Array(blocks * M * n);
+  const ga = new Float64Array(A.length);
+  const gb = new Float64Array(B.length);
+  const Bt = new Float64Array(k * n);
+  const gbt = new Float64Array(k * n);
+
+  // The kernels are closures over this node's sizes, not shared functions
+  // taking them as arguments: V8 optimizes the inner loops markedly better
+  // when M, k and n are captured constants (a shared kernel cost a third of
+  // the forward pass on a 300 × 300 product). Offsets select a block.
+  const forwardBlock = (oo, ao, bo) => {
+    out.fill(0, oo, oo + M * n); // the kernel accumulates
+    for (let i = 0; i < M; i++) {
+      const ai = ao + i * k;
+      const oi = oo + i * n;
       for (let p = 0; p < k; p++) {
-        const aip = A[i * k + p];
+        const aip = A[ai + p];
         if (aip === 0) continue;
-        for (let j = 0; j < n; j++) out[i * n + j] += aip * B[p * n + j];
+        const bp = bo + p * n;
+        for (let j = 0; j < n; j++) out[oi + j] += aip * B[bp + j];
       }
     }
   };
-
-  const shape = vectorRhs ? [m] : [m, n];
-  const ga = new Float64Array(m * k);
-  const gb = new Float64Array(k * n);
-  const Bt = new Float64Array(k * n);
-  const gbt = new Float64Array(k * n);
-  return node({ data: out, shape }, [a, b], (g) => {
-    // Ā = Ḡ Bᵀ, B̄ = Aᵀ Ḡ, walked as (i, j, p) so a zero entry of Ḡ is
-    // skipped whole: it contributes nothing, and a non-finite A or B meeting
-    // it does not become NaN. The p loop runs along rows of A and of Ā; B is
-    // read through its transpose and B̄ is accumulated transposed, so that
-    // loop is contiguous in all four arrays instead of striding by n.
+  // Ā = Ḡ Bᵀ, B̄ = Aᵀ Ḡ, walked as (i, j, p) so a zero entry of Ḡ is skipped
+  // whole: it contributes nothing, and a non-finite A or B meeting it does
+  // not become NaN. The p loop runs along rows of A and of Ā; B is read
+  // through its transpose and B̄ is accumulated transposed, so that loop is
+  // contiguous in all four arrays instead of striding by n.
+  const backwardBlock = (g, go, ao, bo) => {
     for (let p = 0; p < k; p++) {
-      for (let j = 0; j < n; j++) Bt[j * k + p] = B[p * n + j];
+      const bp = bo + p * n;
+      for (let j = 0; j < n; j++) Bt[j * k + p] = B[bp + j];
     }
-    ga.fill(0);
+    ga.fill(0, ao, ao + M * k);
     gbt.fill(0);
-    for (let i = 0; i < m; i++) {
-      const ai = i * k;
+    for (let i = 0; i < M; i++) {
+      const ai = ao + i * k;
+      const gi = go + i * n;
       for (let j = 0; j < n; j++) {
-        const gij = g[i * n + j];
+        const gij = g[gi + j];
         if (gij === 0) continue;
         const bj = j * k;
         for (let p = 0; p < k; p++) {
@@ -719,8 +728,17 @@ export function matmul(aIn, bIn) {
       }
     }
     for (let p = 0; p < k; p++) {
-      for (let j = 0; j < n; j++) gb[p * n + j] = gbt[j * k + p];
+      const bp = bo + p * n;
+      for (let j = 0; j < n; j++) gb[bp + j] = gbt[j * k + p];
     }
+  };
+  const forward = () => {
+    for (let t = 0; t < blocks; t++) forwardBlock(t * M * n, t * M * k, batched ? t * k * n : 0);
+  };
+
+  const shape = vectorRhs ? [...lead, m] : [...lead, m, n];
+  return node({ data: out, shape }, [a, b], (g) => {
+    for (let t = 0; t < blocks; t++) backwardBlock(g, t * M * n, t * M * k, batched ? t * k * n : 0);
     return [ga, gb];
   }, forward, { op: 'matmul' });
 }
@@ -756,25 +774,34 @@ export function dot(uIn, vIn) {
 }
 
 /**
- * Matrix transpose.
+ * Permute axes. With no permutation the axes reverse, which for a matrix is
+ * the transpose; `transpose(x, [0, 2, 1])` swaps the last two axes of a
+ * batch, the `Kᵀ` in attention's `Q · Kᵀ`. The adjoint applies the inverse
+ * permutation, adding into the parent in place.
+ *
  * @param {Var|number[][]} aIn
+ * @param {number[]} [perm] - a permutation of `0 … rank − 1`; reversed by default
  * @returns {Var}
  */
-export function transpose(aIn) {
+export function transpose(aIn, perm) {
   const a = toVar(aIn, 'transpose operand');
-  if (a.shape.length !== 2) {
-    throw new Error(`transpose: needs a matrix, got ${shapeStr(a.shape)}`);
+  const rank = a.shape.length;
+  if (rank < 2) {
+    throw new Error(`transpose: needs at least two axes, got ${shapeStr(a.shape)}`);
   }
-  const [m, n] = a.shape;
-  const out = new Float64Array(m * n);
-  const forward = () => {
-    for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) out[j * m + i] = a.value.data[i * n + j];
-  };
-  const ga = new Float64Array(m * n);
-  return node({ data: out, shape: [n, m] }, [a], (g) => {
-    for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) ga[i * n + j] = g[j * m + i];
-    return [ga];
-  }, forward, { op: 'transpose' });
+  const p = perm === undefined ? a.shape.map((_, k) => rank - 1 - k) : perm;
+  if (!Array.isArray(p) || p.length !== rank || !p.every((k) => Number.isInteger(k) && k >= 0 && k < rank) ||
+    new Set(p).size !== rank) {
+    throw new Error(`transpose: perm must be a permutation of 0…${rank - 1}, got ${JSON.stringify(perm)}`);
+  }
+  const own = stridesOf(a.shape);
+  const shape = p.map((k) => a.shape[k]);
+  const strides = p.map((k) => own[k]);
+  const src = a.value.data;
+  const out = new Float64Array(src.length);
+  const forward = () => copyStrided(out, src, shape, strides, 0);
+  return node({ data: out, shape }, [a], (g) => [(into) => addStrided(into, g, shape, strides, 0)],
+    forward, perm === undefined ? { op: 'transpose' } : { op: 'transpose', args: [p.slice()] });
 }
 
 /**
@@ -859,17 +886,17 @@ export function addDiag(aIn, alphaIn) {
  * optimizer or a sampler hands you, into the matrix a model is written in.
  *
  * A batch of sequences moves between `[n, T, F]`, `[n, T·F]` and `[n·T, F]`
- * the same way: the last is what lets one matmul apply a weight matrix to
- * every time step of every sequence at once.
+ * the same way: the second is what a dense layer reads, the third what lets
+ * one matmul apply a weight matrix to every time step of every sequence.
  *
  * @param {Var|number[]|number[][]} aIn
- * @param {number[]} shape - rank 0 to 3; must hold the same element count
+ * @param {number[]} shape - positive integers holding the same element count
  * @returns {Var}
  */
 export function reshape(aIn, shape) {
   const a = toVar(aIn, 'reshape operand');
-  if (!Array.isArray(shape) || shape.length > MAX_RANK || shape.some((d) => !Number.isInteger(d) || d < 1)) {
-    throw new Error(`reshape: shape must be up to ${MAX_RANK} positive integers`);
+  if (!Array.isArray(shape) || shape.some((d) => !Number.isInteger(d) || d < 1)) {
+    throw new Error('reshape: shape must be an array of positive integers');
   }
   if (sizeOf(shape) !== a.value.data.length) {
     throw new Error(
@@ -882,11 +909,17 @@ export function reshape(aIn, shape) {
 }
 
 /**
- * Extract a contiguous submatrix (or subvector) — the differentiable form of
- * `rows.slice(...).map((r) => r.slice(...))`.
+ * Extract a contiguous block along every axis — the differentiable form of
+ * `rows.slice(...).map((r) => r.slice(...))`, at any rank.
  *
  * A structural equation model needs it: Σ is built over latent AND observed
- * variables, then only the observed block is compared with the data.
+ * variables, then only the observed block is compared with the data. A
+ * recurrent network needs it too: one time step of `[n, T, F]` is
+ * `slice(x, [0, t, 0], [n, 1, F])`.
+ *
+ * The adjoint adds into the parent's gradient in place rather than returning
+ * a dense buffer the size of the parent: T time-step slices of one batch
+ * would otherwise cost O(T²) in the reverse pass.
  *
  * @param {Var|number[]|number[][]} aIn
  * @param {number[]} start - starting index per axis
@@ -897,7 +930,7 @@ export function slice(aIn, start, size) {
   const a = toVar(aIn, 'slice operand');
   const rank = a.shape.length;
   if (rank === 0) throw new Error('slice: cannot slice a scalar');
-  if (start.length !== rank || size.length !== rank) {
+  if (!Array.isArray(start) || !Array.isArray(size) || start.length !== rank || size.length !== rank) {
     throw new Error(`slice: start and size need ${rank} entr${rank === 1 ? 'y' : 'ies'} for a ${shapeStr(a.shape)} operand`);
   }
   for (let d = 0; d < rank; d++) {
@@ -910,77 +943,27 @@ export function slice(aIn, start, size) {
       );
     }
   }
-
+  const strides = stridesOf(a.shape);
+  let base = 0;
+  for (let d = 0; d < rank; d++) base += start[d] * strides[d];
+  const shape = size.slice();
   const src = a.value.data;
-  if (rank === 1) {
-    const [s0] = start;
-    const [n0] = size;
-    const out = new Float64Array(n0);
-    const forward = () => out.set(src.subarray(s0, s0 + n0));
-    return node({ data: out, shape: [n0] }, [a], (g) => [(into) => {
-      for (let i = 0; i < n0; i++) into[s0 + i] += g[i];
-    }], forward, { op: 'slice', args: [start.slice(), size.slice()] });
-  }
-  if (rank === 3) return slice3(a, start, size);
-  const [, n] = a.shape;
-  const [s0, s1] = start;
-  const [m0, n0] = size;
-  const out = new Float64Array(m0 * n0);
-  const forward = () => {
-    for (let i = 0; i < m0; i++) {
-      for (let j = 0; j < n0; j++) out[i * n0 + j] = src[(s0 + i) * n + (s1 + j)];
-    }
-  };
-  return node({ data: out, shape: [m0, n0] }, [a], (g) => [(into) => {
-    for (let i = 0; i < m0; i++) {
-      for (let j = 0; j < n0; j++) into[(s0 + i) * n + (s1 + j)] += g[i * n0 + j];
-    }
-  }], forward, { op: 'slice', args: [start.slice(), size.slice()] });
+  const out = new Float64Array(sizeOf(shape));
+  const forward = () => copyStrided(out, src, shape, strides, base);
+  return node({ data: out, shape }, [a], (g) => [(into) => addStrided(into, g, shape, strides, base)],
+    forward, { op: 'slice', args: [start.slice(), size.slice()] });
 }
 
 /**
- * A rank-3 block: whole runs along the last axis are copied at once, so one
- * time step `[n, 1, F]` of a `[n, T, F]` batch costs n copies of F. Like
- * every slice, its adjoint adds into the parent's gradient in place rather
- * than returning a dense buffer: T time-step slices of one batch would
- * otherwise cost O(T²) in the reverse pass. @private
- */
-function slice3(a, start, size) {
-  const [, d1, d2] = a.shape;
-  const [s0, s1, s2] = start;
-  const [n0, n1, n2] = size;
-  const src = a.value.data;
-  const out = new Float64Array(n0 * n1 * n2);
-  const forward = () => {
-    for (let i = 0; i < n0; i++) {
-      for (let j = 0; j < n1; j++) {
-        const from = ((s0 + i) * d1 + (s1 + j)) * d2 + s2;
-        out.set(src.subarray(from, from + n2), (i * n1 + j) * n2);
-      }
-    }
-  };
-  return node({ data: out, shape: [n0, n1, n2] }, [a], (g) => [(into) => {
-    for (let i = 0; i < n0; i++) {
-      for (let j = 0; j < n1; j++) {
-        const o = (i * n1 + j) * n2;
-        const to = ((s0 + i) * d1 + (s1 + j)) * d2 + s2;
-        for (let k = 0; k < n2; k++) into[to + k] += g[o + k];
-      }
-    }
-  }], forward, { op: 'slice', args: [start.slice(), size.slice()] });
-}
-
-/**
- * Join parts end to end. Scalars and vectors become one vector. Matrices join
- * along `axis`: 0 stacks their rows (same column count), 1 puts them side by
- * side (same row count), which is how a network joins the outputs of two
- * branches for every row of a batch. Rank-3 tensors join along any of their
- * three axes, every other axis agreeing: axis 1 of `[n, 1, H]` states is how
- * a recurrent network stacks its steps back into `[n, T, H]`. The adjoint
- * hands each part its slice.
+ * Join parts end to end. Scalars and vectors become one vector. Tensors of
+ * rank 2 or more join along `axis`, agreeing on every other axis: for
+ * matrices 0 stacks rows and 1 puts them side by side, which is how a
+ * network joins the outputs of two branches for every row of a batch; axis
+ * 1 of `[n, 1, H]` states is how a recurrent network stacks its steps back
+ * into `[n, T, H]`. The adjoint hands each part its slice.
  *
  * @param {Array<Var|number|number[]|number[][]>} parts
- * @param {{ axis?: number }} [options] - for matrices and rank 3; 0 by default
+ * @param {{ axis?: number }} [options] - for rank 2 and above; 0 by default
  * @returns {Var}
  */
 export function concat(parts, options = {}) {
@@ -988,13 +971,11 @@ export function concat(parts, options = {}) {
     throw new Error('concat: needs a non-empty array of parts');
   }
   const vars = parts.map((p, i) => toVar(p, `concat part ${i}`));
-  const rank = vars[0].shape.length;
-  if (rank === 2) return concatMatrices(vars, options.axis ?? 0);
-  if (rank === 3) return concat3(vars, options.axis ?? 0);
+  if (vars[0].shape.length >= 2) return concatAlong(vars, options.axis ?? 0);
   for (const v of vars) {
     if (v.shape.length > 1) {
       throw new Error(
-        `concat: parts must all be scalars and vectors, all matrices, or all rank 3; got ${shapeStr(v.shape)}`,
+        `concat: parts must all be scalars and vectors, or all of one rank ≥ 2; got ${shapeStr(v.shape)}`,
       );
     }
   }
@@ -1019,84 +1000,28 @@ export function concat(parts, options = {}) {
   }, forward, { op: 'concat', list: true });
 }
 
-/** Matrices along axis 0 (rows) or 1 (columns). @private */
-function concatMatrices(vars, axis) {
-  if (axis !== 0 && axis !== 1) throw new Error('concat: axis must be 0 or 1');
-  for (const v of vars) {
-    if (v.shape.length !== 2) {
-      throw new Error(`concat: parts must all be matrices, got ${shapeStr(v.shape)}`);
-    }
-    if (v.shape[1 - axis] !== vars[0].shape[1 - axis]) {
-      throw new Error(
-        `concat: parts must agree on axis ${1 - axis}, got ${shapeStr(vars[0].shape)} and ${shapeStr(v.shape)}`,
-      );
-    }
-  }
-  if (axis === 0) {
-    // Row-major storage makes stacking rows a plain append.
-    const cols = vars[0].shape[1];
-    const rows = vars.reduce((a, v) => a + v.shape[0], 0);
-    const out = new Float64Array(rows * cols);
-    const forward = () => {
-      let off = 0;
-      for (const v of vars) {
-        out.set(v.value.data, off);
-        off += v.value.data.length;
-      }
-    };
-    return node({ data: out, shape: [rows, cols] }, vars, (g) => {
-      const contribs = [];
-      let o = 0;
-      for (const v of vars) {
-        contribs.push(g.slice(o, o + v.value.data.length));
-        o += v.value.data.length;
-      }
-      return contribs;
-    }, forward, { op: 'concat', list: true, args: [{ axis: 0 }] });
-  }
-  const rows = vars[0].shape[0];
-  const widths = vars.map((v) => v.shape[1]);
-  const cols = widths.reduce((a, b) => a + b, 0);
-  const out = new Float64Array(rows * cols);
-  const forward = () => {
-    let off = 0;
-    for (let k = 0; k < vars.length; k++) {
-      const src = vars[k].value.data;
-      const w = widths[k];
-      for (let i = 0; i < rows; i++) out.set(src.subarray(i * w, i * w + w), i * cols + off);
-      off += w;
-    }
-  };
-  const bufs = widths.map((w) => new Float64Array(rows * w));
-  return node({ data: out, shape: [rows, cols] }, vars, (g) => {
-    let off = 0;
-    for (let k = 0; k < vars.length; k++) {
-      const w = widths[k];
-      const b = bufs[k];
-      for (let i = 0; i < rows; i++) b.set(g.subarray(i * cols + off, i * cols + off + w), i * w);
-      off += w;
-    }
-    return bufs;
-  }, forward, { op: 'concat', list: true, args: [{ axis: 1 }] });
-}
+/** How a rank is named in an error message. @private */
+const rankName = (rank) => (rank === 2 ? 'matrices' : `rank-${rank} tensors`);
 
 /**
- * Rank-3 tensors along `axis`. Seen as `[outer, block]`, where `outer` is the
- * product of the axes before `axis` and each part's block is everything from
- * `axis` on, every part is a run of `outer` contiguous blocks. @private
+ * Parts of one rank ≥ 2 along `axis`. Seen as `[outer, block]`, where `outer`
+ * is the product of the axes before `axis` and each part's block is
+ * everything from `axis` on, every part is a run of `outer` contiguous
+ * blocks. @private
  */
-function concat3(vars, axis) {
-  if (axis !== 0 && axis !== 1 && axis !== 2) throw new Error('concat: axis must be 0, 1 or 2 for rank 3');
+function concatAlong(vars, axis) {
   const ref = vars[0].shape;
+  const rank = ref.length;
+  if (!Number.isInteger(axis) || axis < 0 || axis >= rank) {
+    throw new Error(`concat: axis must be an integer from 0 to ${rank - 1} for ${rankName(rank)}, got ${axis}`);
+  }
   for (const v of vars) {
-    if (v.shape.length !== 3) {
-      throw new Error(`concat: parts must all be rank 3, got ${shapeStr(v.shape)}`);
+    if (v.shape.length !== rank) {
+      throw new Error(`concat: parts must all be ${rankName(rank)}, got ${shapeStr(v.shape)}`);
     }
-    for (let k = 0; k < 3; k++) {
+    for (let k = 0; k < rank; k++) {
       if (k !== axis && v.shape[k] !== ref[k]) {
-        throw new Error(
-          `concat: parts must agree on every axis but ${axis}, got ${shapeStr(ref)} and ${shapeStr(v.shape)}`,
-        );
+        throw new Error(`concat: parts must agree on axis ${k}, got ${shapeStr(ref)} and ${shapeStr(v.shape)}`);
       }
     }
   }
@@ -1111,7 +1036,8 @@ function concat3(vars, axis) {
     for (let k = 0; k < vars.length; k++) {
       const src = vars[k].value.data;
       const b = blocks[k];
-      for (let o = 0; o < outer; o++) out.set(src.subarray(o * b, o * b + b), o * width + off);
+      if (outer === 1) out.set(src, off);
+      else for (let o = 0; o < outer; o++) out.set(src.subarray(o * b, o * b + b), o * width + off);
       off += b;
     }
   };
@@ -1129,18 +1055,18 @@ function concat3(vars, axis) {
 }
 
 /**
- * Pick rows of a table by index: `out[i] = table[index[i]]`. The result has
- * the index's shape followed by a row's shape, so a `[V, D]` embedding table
- * gathered at `[n, T]` token ids gives `[n, T, D]`, and a `[K]` vector of
- * group effects gathered at `[n]` group labels gives `[n]` — a hierarchical
- * model's `z[site]`.
+ * Pick entries along the first axis of a table by index:
+ * `out[i] = table[index[i]]`. The result has the index's shape followed by
+ * the rest of the table's, so a `[V, D]` embedding table gathered at `[n, T]`
+ * token ids gives `[n, T, D]`, and a `[K]` vector of group effects gathered
+ * at `[n]` group labels gives `[n]` — a hierarchical model's `z[site]`.
  *
  * The index is not differentiated. It may be a constant, or an input leaf
  * that changes between calls (a mini-batch of token ids); it is read and
  * checked on every forward pass. The adjoint scatter-adds back into the
- * table, so a row picked twice receives both contributions.
+ * table, so an entry picked twice receives both contributions.
  *
- * @param {Var|number[]|number[][]} tableIn - rank 1 or 2
+ * @param {Var|number[]|number[][]} tableIn - rank 1 or more
  * @param {Var|number|number[]|number[][]} indexIn - integers in [0, rows)
  * @returns {Var}
  *
@@ -1152,12 +1078,6 @@ export function gather(tableIn, indexIn) {
   const index = toVar(indexIn, 'gather index');
   if (a.shape.length === 0) throw new Error('gather: the table cannot be a scalar');
   const shape = [...index.shape, ...a.shape.slice(1)];
-  if (shape.length > MAX_RANK) {
-    throw new Error(
-      `gather: a ${shapeStr(index.shape)} index into a ${shapeStr(a.shape)} table ` +
-        `would have rank ${shape.length}; the most is ${MAX_RANK}`,
-    );
-  }
   const rows = a.shape[0];
   const width = sizeOf(a.shape.slice(1));
   const m = index.value.data.length;
@@ -1176,16 +1096,13 @@ export function gather(tableIn, indexIn) {
       else out.set(A.subarray(r * width, r * width + width), i * width);
     }
   };
-  const ga = new Float64Array(A.length);
-  return node({ data: out, shape }, [a, index], (g) => {
-    ga.fill(0);
+  return node({ data: out, shape }, [a, index], (g) => [(into) => {
     for (let i = 0; i < m; i++) {
       const to = at[i] * width;
       const from = i * width;
-      for (let j = 0; j < width; j++) ga[to + j] += g[from + j];
+      for (let j = 0; j < width; j++) into[to + j] += g[from + j];
     }
-    return [ga, null];
-  }, forward, { op: 'gather' });
+  }, null], forward, { op: 'gather' });
 }
 
 export { zeros, sameShape };

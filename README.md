@@ -68,12 +68,15 @@ add on top of the language's limit is nesting, and that part is avoidable:
 is one call rather than four wrapped ones. The graph is identical either way.
 `sub` and `div` stay binary, since `sub(a, b, c)` reads ambiguously.
 
-**Rank capped at 3.** Scalars, vectors and matrices carry every statistical
-model in the suite, and the linear algebra stays there. Rank 3 exists for one
-consumer: a batch of sequences, `[n, T, F]`, which a recurrent network slices
-one time step at a time. The structural ops (`reshape`, `slice`, `concat`,
-`gather`, the reductions) and the elementwise ops accept it; rank-N would
-cost broadcasting complexity in every adjoint for no consumer.
+**Any rank, matrices where it matters.** Scalars, vectors and matrices carry
+every statistical model in the suite, and the linear algebra stays there.
+Networks need more: a batch of sequences `[n, T, F]`, a batch of images
+`[n, H, W, C]`. Storage is flat and row-major at every rank, so a window, a
+permutation of the axes, or an operand repeated along broadcast axes is the
+same storage read through different strides. Those ops share one strided
+copy and its adjoint, and the elementwise kernels stay single flat loops: a
+broadcast operand is expanded into a buffer first, at no cost to the
+same-shape and scalar cases that dominate the statistical models.
 
 Forward factorizations come from [`@tangent.to/lina`](https://github.com/tangent-to/lina),
 which is scipy-validated.
@@ -98,10 +101,16 @@ Swap the kernel expression and the gradients follow. No derivation.
 
 ## Validation
 
-Every adjoint is checked two ways, because finite differences alone would not
-catch an adjoint that is systematically wrong but smooth:
+Every adjoint is checked against references it does not share code with,
+because finite differences alone would not catch an adjoint that is
+systematically wrong but smooth:
 
 - central finite differences on the composed objective;
+- for the n-dimensional ops (broadcasting, reductions, `transpose`,
+  `matmul`, `slice`, `concat`, `gather`), PyTorch's values and autograd
+  gradients and base R's values, all in float64, on asymmetric shapes so a
+  swapped axis cannot pass. `npm run references` regenerates the committed
+  fixtures from `tests/references/`;
 - closed forms known exactly — `d log|A| / dA = A⁻¹`, and for the Gaussian
   process the trace identity `∂L/∂θ = ½ tr((ααᵀ − K⁻¹) ∂K/∂θ)`, computed
   independently with lina.
@@ -270,11 +279,11 @@ what a wide Jacobian would want.
 | `valueAndGradFns(f, opts)` | the `(fn, gradFn)` pair mc's `potential` takes |
 | `add` `mul` | elementwise, and variadic: `add(a, b, c, d)` |
 | `sub` `div` `neg` | the same, strictly binary |
-| | binary ops broadcast a scalar against anything; a vector along the last axis of a matrix or rank-3 tensor, `add(matmul(X, W), b)`; and an `[n, 1]` column across an `[n, d]` matrix, `mul(mask, h)` |
+| | binary ops broadcast by numpy's rules, aligned from the right: `add(matmul(X, W), b)` with `b` of `[d]`, `mul(mask, h)` with `mask` of `[n, 1]`. The result must be one operand's shape, so `[n]` against `[n, 1]` is refused rather than silently becoming `[n, n]` |
 | `exp` `log` `sqrt` `square` `pow` `tanh` `sigmoid` | elementwise functions |
 | `maximum` `minimum` `relu` | elementwise clamps. At a tie the adjoint goes to the left operand; `relu'(0) = 0` |
 | `sum` `mean` `max` | reductions to a scalar, or along one axis with `{ axis, keepDims }`: `max(Z, { axis: 1, keepDims: true })` is `[n, 1]`. `max` sends its adjoint to the first winner |
-| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation; `reshape`, `slice` and `concat(parts, { axis })` work up to rank 3, so one time step of `[n, T, F]` is `slice(x, [0, t, 0], [n, 1, F])` |
+| `matmul` `dot` `transpose` `reshape` `slice` `concat` `diagPart` `trace` `addDiag` | array manipulation, at any rank where it makes sense: `matmul` multiplies over the last two axes (`[n, T, F] · [F, H]`, or block by block when both have the same leading axes); `transpose(x, perm)` permutes axes; `slice(x, [0, t, 0], [n, 1, F])` is one time step; `concat(parts, { axis })` |
 | `gather(table, index)` | rows of a table by integer index, shaped as the index followed by a row: an embedding lookup, or a hierarchical model's `z[site]`. The index may be an input that changes per call |
 | `cholesky` `triangularSolve` `logdetPSD` `solvePSD` | differentiable linear algebra, symmetric positive definite |
 | `solveGeneral` `inv` | the same for a general square matrix (LU) |
