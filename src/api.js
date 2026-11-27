@@ -23,7 +23,7 @@
  */
 
 import { Var, topoOrder, variable } from './tape.js';
-import { isTensor, shapeStr, sizeOf, toNested } from './tensor.js';
+import { isTensor, sameShape, shapeStr, sizeOf, toNested } from './tensor.js';
 import * as ops from './ops.js';
 import * as linalg from './linalg.js';
 
@@ -191,33 +191,35 @@ export function grad(f) {
   return (x, feed) => vg(x, feed).gradient;
 }
 
-/** Structural equality over a `{name: number|number[]}` parameter map. @private */
+/** Structural equality over scalar, array, tensor, and named parameters. @private */
 function sameParams(a, b) {
   if (a === undefined || b === undefined) return false;
   if (typeof a === 'number') return a === b;
   if (isTensor(a)) {
-    if (!isTensor(b) || a.data.length !== b.data.length) return false;
+    if (!isTensor(b) || !sameShape(a.shape, b.shape) || a.data.length !== b.data.length) return false;
     for (let i = 0; i < a.data.length; i++) if (a.data[i] !== b.data[i]) return false;
     return true;
   }
   if (Array.isArray(a) || a instanceof Float64Array) {
     if (!(Array.isArray(b) || b instanceof Float64Array) || a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i] && !sameParams(a[i], b[i])) return false;
+    }
     return true;
   }
-  if (a === null || typeof a !== 'object') return false;
+  if (!isParamMap(a) || !isParamMap(b)) return false;
   const ka = Object.keys(a);
   if (ka.length !== Object.keys(b).length) return false;
   for (const k of ka) if (!sameParams(a[k], b[k])) return false;
   return true;
 }
 
-/** Defensive copy of a parameter map, so a caller mutating in place cannot
+/** Defensive copy of parameters, so a caller mutating in place cannot
  * poison the cache below. @private */
 function copyParams(x) {
-  if (typeof x === 'number') return x;
-  if (isTensor(x)) return { data: Float64Array.from(x.data), shape: x.shape.slice() };
-  if (Array.isArray(x) || x instanceof Float64Array) return Array.from(x);
+  if (typeof x === 'number' || isTensor(x) || Array.isArray(x) || x instanceof Float64Array) {
+    return ownedCopy(x);
+  }
   const out = {};
   for (const [k, v] of Object.entries(x)) out[k] = copyParams(v);
   return out;

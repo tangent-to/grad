@@ -80,4 +80,13 @@ describe('typed leaves', () => {
     gradient({ W: tensor([0.1, 0.2, 0.3, 0.5], [2, 2]), b });
     expect(calls).toBe(2);
   });
+
+  it('invalidates the cache when a tensor changes shape without changing its data', () => {
+    const { value, gradient } = splitValueAndGrad(valueAndGrad((x) => sum(square(x))));
+    const x = tensor([1, 2, 3, 4], [2, 2]);
+    expect(value(x)).toBe(30);
+    x.shape[0] = 1;
+    x.shape[1] = 4;
+    expect(gradient(x)).toEqual(tensor([2, 4, 6, 8], [1, 4]));
+  });
 });

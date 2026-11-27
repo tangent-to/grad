@@ -53,6 +53,24 @@ describe('valueAndGradFns', () => {
     expect(g2).toEqual({ beta: [20, 4, 6] });
   });
 
+  it.each([
+    ['plain rows', (row) => row],
+    ['typed rows', (row) => Float64Array.from(row)],
+  ])('compares matrices by value and detects in-place edits to %s', (_label, makeRow) => {
+    const objective = vi.fn(({ weights }) => sum(square(weights)));
+    const { value, gradient } = valueAndGradFns(objective);
+    const weights = [[1, 2], [3, 4]].map(makeRow);
+    expect(value({ weights })).toBe(30);
+    expect(gradient({ weights })).toEqual({ weights: [[2, 4], [6, 8]] });
+    expect(objective).toHaveBeenCalledTimes(1);
+
+    weights[0][0] = 10;
+    expect(value({ weights })).toBe(129);
+    expect(gradient({ weights: [[10, 2], [3, 4]].map(makeRow) }))
+      .toEqual({ weights: [[20, 4], [6, 8]] });
+    expect(objective).toHaveBeenCalledTimes(2);
+  });
+
   it('does not hand out a gradient that a later call can mutate', () => {
     const f = (p) => sum(square(p.beta));
     const { gradient } = valueAndGradFns(f);

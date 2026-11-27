@@ -43,5 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluated, there being several.
 
 ### Fixed
+- The shared value and gradient cache compares matrix entries and tensor
+  shapes by value, including after in-place parameter edits.
 - The zero gradient reported for a matrix parameter the objective never reads
   was a flat array; it is now nested rows, the form the parameter arrived in.
