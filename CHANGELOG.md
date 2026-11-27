@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Rank-3 tensors**, for a batch of sequences `[n, T, F]`. Nested
+  `[n][T][F]` arrays are read and written like rows; plans are keyed by the
+  full shape. `reshape` accepts targets up to rank 3; `slice` takes windows of
+  rank-3 tensors, one time step being `slice(x, [0, t, 0], [n, 1, F])`; and
+  `concat` joins rank-3 parts along any axis, axis 1 stacking per-step states
+  back into a sequence. The elementwise ops accept rank 3 unchanged.
+- **Column broadcasting.** The binary elementwise ops accept an `[n, d]`
+  operand with an `[n, 1]` operand on either side, one weight per row: a
+  padding mask applied to a recurrent state. The column's adjoint is the row
+  sum. Row broadcasting of a `[d]` vector now also reaches the last axis of a
+  rank-3 tensor, a bias added at every time step.
+- **Axis reductions.** `sum`, `mean` and the new `max` take
+  `{ axis, keepDims }`; with `keepDims` the reduced axis stays at length 1 and
+  broadcasts back, which is what a stable softmax or log-sum-exp needs.
+  Without options they reduce to a scalar as before, and serialize as before.
+  `max` sends its adjoint to the first maximal entry and propagates NaN.
+- **`gather(table, index)`** picks rows of a table by integer index, shaped as
+  the index followed by a row, with a scatter-add adjoint: an embedding
+  lookup, or a hierarchical model's `z[site]`. The index may be a constant or
+  an input leaf, and is validated on every forward pass.
 - `concat` joins matrices as well as vectors: along rows (`axis: 0`), or
   side by side along columns (`axis: 1`), which is how a network joins two
   branches for every row of a batch. The axis is serialized with the plan.
@@ -43,6 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluated, there being several.
 
 ### Fixed
+- A plan for a rank-3 argument no longer shares a cache key with a matrix of
+  the same leading shape; before, `[2, 3, 4]` and `[2, 3]` both signed as
+  `2x3` and the second replayed the first's graph.
+- `slice` no longer allocates and accumulates a gradient buffer the size of
+  its whole parent: its adjoint adds into the touched entries only. A
+  recurrent network slicing T steps from one batch paid O(T²) for that in the
+  reverse pass.
+- `matmul`'s reverse pass reads and writes contiguously; about 15% faster on
+  a 300 × 300 product, and on the recurrent shapes above.
 - `compileFromJSON` defers op evaluation until the restored plan receives real
   parameters and inputs, so domain-sensitive ops such as `cholesky` and
   `solveGeneral` succeed on serialized positive-definite matrix objectives.

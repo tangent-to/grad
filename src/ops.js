@@ -1,16 +1,18 @@
 /**
  * Differentiable operations.
  *
- * Broadcasting is deliberately limited to two cases: a scalar against
- * anything, and a vector against the rows of a matrix (`[n, d]` with `[d]`).
- * Full numpy-style broadcasting would double the size of every adjoint here
- * for cases the suite's models do not use. The scalar case covers a rate
- * against a vector or a penalty against a matrix; the row case is a bias
- * added to every row of `X·W`, or a column scaling, and its adjoint is a
- * column sum, which costs nothing extra.
+ * Broadcasting is deliberately limited to three cases: a scalar against
+ * anything; a vector against the last axis of a matrix or rank-3 tensor
+ * (`[n, d]` or `[n, T, d]` with `[d]`); and a column against a matrix
+ * (`[n, d]` with `[n, 1]`). Full numpy-style broadcasting would double the
+ * size of every adjoint here for cases the suite's models do not use. The
+ * scalar case covers a rate against a vector or a penalty against a matrix;
+ * the row case is a bias added to every row of `X·W`, and its adjoint is a
+ * column sum; the column case is one weight per row — a recurrent network's
+ * padding mask applied to its state — and its adjoint is a row sum.
  */
 
-import { sameShape, shapeStr, sizeOf, zeros } from './tensor.js';
+import { MAX_RANK, sameShape, shapeStr, sizeOf, zeros } from './tensor.js';
 import { node, requireSameShape, toVar } from './tape.js';
 
 /**
@@ -41,17 +43,50 @@ function foldRows(contrib, out) {
 }
 
 /**
- * Shape of an elementwise result, allowing a scalar on either side, or a
- * vector against a matrix whose rows have that length.
+ * Fold a gradient contribution back onto an `[n, 1]` column that was spread
+ * across the `d` columns of a matrix: each row sums back into its entry.
+ * @private
+ */
+function foldCols(contrib, out, d) {
+  for (let i = 0, o = 0; i < out.length; i++, o += d) {
+    let s = 0;
+    for (let j = 0; j < d; j++) s += contrib[o + j];
+    out[i] = s;
+  }
+  return out;
+}
+
+/** Is `v` a vector spread along the last axis of `w`? @private */
+const spreadsAsRow = (v, w) =>
+  v.shape.length === 1 && w.shape.length >= 2 && w.shape[w.shape.length - 1] === v.shape[0];
+
+/** Is `v` an `[n, 1]` column spread across the columns of the `[n, d]` matrix `w`? @private */
+const spreadsAsCol = (v, w) =>
+  v.shape.length === 2 && w.shape.length === 2 && v.shape[1] === 1 && v.shape[0] === w.shape[0];
+
+/**
+ * Shape of an elementwise result: a scalar on either side, a vector against
+ * the last axis of a matrix or rank-3 tensor, or a column against a matrix.
  * @private
  */
 function broadcastShape(a, b, op) {
   if (a.shape.length === 0) return b.shape;
   if (b.shape.length === 0) return a.shape;
-  if (a.shape.length === 2 && b.shape.length === 1 && a.shape[1] === b.shape[0]) return a.shape;
-  if (b.shape.length === 2 && a.shape.length === 1 && b.shape[1] === a.shape[0]) return b.shape;
+  if (sameShape(a.shape, b.shape)) return a.shape;
+  if (spreadsAsRow(b, a) || spreadsAsCol(b, a)) return a.shape;
+  if (spreadsAsRow(a, b) || spreadsAsCol(a, b)) return b.shape;
   requireSameShape(a, b, op);
   return a.shape;
+}
+
+/**
+ * How an operand is read against the output shape. @private
+ * @returns {'same'|'scalar'|'row'|'col'}
+ */
+function readMode(v, shape) {
+  if (v.shape.length === 0) return 'scalar';
+  if (sameShape(v.shape, shape)) return 'same';
+  return v.shape.length === 1 ? 'row' : 'col';
 }
 
 /**
@@ -64,14 +99,20 @@ function broadcastShape(a, b, op) {
 const strideOf = (v) => (v.shape.length === 0 ? 0 : 1);
 
 /**
- * A vector broadcast over the rows of a matrix is read through a buffer that
- * holds it tiled to the output's size, refilled on every forward pass. That
+ * A vector broadcast along the last axis is read through a buffer that holds
+ * it tiled to the output's size, refilled on every forward pass; a column
+ * broadcast across a matrix likewise, each entry repeated along its row. That
  * keeps the kernels to the two strides above instead of teaching each of them
  * a modulo, and it keeps the backward kernels reading the same buffer.
  * @private
  */
 function tile(dst, src) {
   for (let o = 0; o < dst.length; o += src.length) dst.set(src, o);
+}
+
+/** Repeat each entry of an `[n, 1]` column `d` times. @private */
+function tileCols(dst, src, d) {
+  for (let i = 0, o = 0; i < src.length; i++, o += d) dst.fill(src[i], o, o + d);
 }
 
 /**
@@ -111,18 +152,22 @@ function binary(op, fwd, bwd) {
     const b = toVar(bIn, `${op} right operand`);
     const shape = broadcastShape(a, b, op);
     const n = sizeOf(shape);
-    // A row-broadcast operand reads through its tiled copy; the others read
-    // their own storage, a scalar at stride 0.
-    const rowA = a.shape.length === 1 && shape.length === 2;
-    const rowB = b.shape.length === 1 && shape.length === 2;
-    const A = rowA ? new Float64Array(n) : a.value.data;
-    const B = rowB ? new Float64Array(n) : b.value.data;
+    const d = shape.length === 0 ? 1 : shape[shape.length - 1];
+    // A row- or column-broadcast operand reads through its tiled copy; the
+    // others read their own storage, a scalar at stride 0.
+    const ma = readMode(a, shape);
+    const mb = readMode(b, shape);
+    const tiled = (m) => m === 'row' || m === 'col';
+    const A = tiled(ma) ? new Float64Array(n) : a.value.data;
+    const B = tiled(mb) ? new Float64Array(n) : b.value.data;
     const sa = strideOf(a);
     const sb = strideOf(b);
     const out = new Float64Array(n);
     const forward = () => {
-      if (rowA) tile(A, a.value.data);
-      if (rowB) tile(B, b.value.data);
+      if (ma === 'row') tile(A, a.value.data);
+      else if (ma === 'col') tileCols(A, a.value.data, d);
+      if (mb === 'row') tile(B, b.value.data);
+      else if (mb === 'col') tileCols(B, b.value.data, d);
       fwd(out, A, B, sa, sb, n);
     };
 
@@ -131,13 +176,16 @@ function binary(op, fwd, bwd) {
     // there is no window in which these could be read stale.
     const ga = new Float64Array(n);
     const gb = new Float64Array(n);
-    const fa = rowA ? new Float64Array(a.shape[0]) : null;
-    const fb = rowB ? new Float64Array(b.shape[0]) : null;
-    const fold = (g, v, f) =>
-      (f !== null ? foldRows(g, f) : v.shape.length === 0 ? unbroadcastScalar(g) : g);
+    const fa = tiled(ma) ? new Float64Array(a.value.data.length) : null;
+    const fb = tiled(mb) ? new Float64Array(b.value.data.length) : null;
+    const fold = (g, m, f) => {
+      if (m === 'row') return foldRows(g, f);
+      if (m === 'col') return foldCols(g, f, d);
+      return m === 'scalar' ? unbroadcastScalar(g) : g;
+    };
     return node({ data: out, shape: shape.slice() }, [a, b], (g) => {
       bwd(g, ga, gb, A, B, out, sa, sb, n);
-      return [fold(ga, a, fa), fold(gb, b, fb)];
+      return [fold(ga, ma, fa), fold(gb, mb, fb)];
     }, forward, { op });
   };
 }
@@ -458,45 +506,147 @@ export function pow(aIn, k) {
 }
 
 /**
- * Sum every element to a scalar.
- * @param {Var|number[]|number[][]} aIn
- * @returns {Var}
+ * Where a reduction runs: the whole tensor, or one axis of it. Seen as
+ * `[outer, len, inner]` around the reduced axis, every reduction below is one
+ * loop shape, whatever the rank. @private
  */
-export function sum(aIn) {
-  const a = toVar(aIn, 'sum operand');
+function reduction(op, a, options) {
   const n = a.value.data.length;
-  const out = new Float64Array(1);
+  const whole = { outer: 1, len: n, inner: 1, shape: [], args: undefined };
+  if (options === undefined) return whole;
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error(`${op}: options must be an object like { axis: 1 }`);
+  }
+  const { axis, keepDims = false } = options;
+  if (axis === undefined) {
+    if (keepDims) throw new Error(`${op}: keepDims needs an axis`);
+    return whole;
+  }
+  const rank = a.shape.length;
+  if (!Number.isInteger(axis) || axis < 0 || axis >= rank) {
+    throw new Error(`${op}: axis ${axis} does not exist on a ${shapeStr(a.shape)} operand`);
+  }
+  const outer = sizeOf(a.shape.slice(0, axis));
+  const inner = sizeOf(a.shape.slice(axis + 1));
+  const shape = keepDims
+    ? a.shape.map((d, k) => (k === axis ? 1 : d))
+    : a.shape.filter((_, k) => k !== axis);
+  return { outer, len: a.shape[axis], inner, shape, args: [{ axis, keepDims: Boolean(keepDims) }] };
+}
+
+/** Sum or mean along a reduction; `scale` is 1 or 1/len. @private */
+function additiveReduce(op, aIn, options, mean) {
+  const a = toVar(aIn, `${op} operand`);
+  const { outer, len, inner, shape, args } = reduction(op, a, options);
+  const scale = mean ? 1 / len : 1;
+  const A = a.value.data;
+  const out = new Float64Array(outer * inner);
   const forward = () => {
-    let s = 0;
-    for (let i = 0; i < n; i++) s += a.value.data[i];
-    out[0] = s;
+    out.fill(0);
+    for (let o = 0; o < outer; o++) {
+      const base = o * len * inner;
+      const ob = o * inner;
+      for (let k = 0; k < len; k++) {
+        const row = base + k * inner;
+        for (let i = 0; i < inner; i++) out[ob + i] += A[row + i];
+      }
+    }
+    if (mean) for (let i = 0; i < out.length; i++) out[i] *= scale;
   };
-  const ga = new Float64Array(n);
-  return node({ data: out, shape: [] }, [a], (g) => {
-    ga.fill(g[0]);
+  const ga = new Float64Array(A.length);
+  return node({ data: out, shape }, [a], (g) => {
+    for (let o = 0; o < outer; o++) {
+      const base = o * len * inner;
+      const ob = o * inner;
+      for (let k = 0; k < len; k++) {
+        const row = base + k * inner;
+        for (let i = 0; i < inner; i++) ga[row + i] = g[ob + i] * scale;
+      }
+    }
     return [ga];
-  }, forward, { op: 'sum' });
+  }, forward, args === undefined ? { op } : { op, args });
 }
 
 /**
- * Mean of every element, as a scalar.
+ * Sum every element to a scalar, or sum along one axis.
+ *
+ * With `{ axis }` the axis is removed: a `[n, d]` matrix summed over axis 1
+ * gives one total per row, `[n]`. `keepDims: true` leaves it in place at
+ * length 1 instead, `[n, 1]`, which broadcasts straight back against the
+ * matrix it came from — what a softmax or a per-row normalization needs.
+ *
  * @param {Var|number[]|number[][]} aIn
+ * @param {{ axis?: number, keepDims?: boolean }} [options]
+ * @returns {Var}
+ *
+ * @example
+ * const rowTotals = sum(X, { axis: 1, keepDims: true }); // [n, 1]
+ */
+export function sum(aIn, options) {
+  return additiveReduce('sum', aIn, options, false);
+}
+
+/**
+ * Mean of every element as a scalar, or the mean along one axis. Options as
+ * on {@link sum}.
+ *
+ * @param {Var|number[]|number[][]} aIn
+ * @param {{ axis?: number, keepDims?: boolean }} [options]
  * @returns {Var}
  */
-export function mean(aIn) {
-  const a = toVar(aIn, 'mean operand');
-  const n = a.value.data.length;
-  const out = new Float64Array(1);
+export function mean(aIn, options) {
+  return additiveReduce('mean', aIn, options, true);
+}
+
+/**
+ * Largest element as a scalar, or the largest along one axis. Options as on
+ * {@link sum}.
+ *
+ * The adjoint goes to the position that won. At a tie that is the FIRST
+ * position along the axis, the same left-wins convention as
+ * {@link maximum}. A NaN wins outright and propagates, so a sampler outside
+ * a support still sees it.
+ *
+ * @param {Var|number[]|number[][]} aIn
+ * @param {{ axis?: number, keepDims?: boolean }} [options]
+ * @returns {Var}
+ *
+ * @example
+ * // A stable log-sum-exp per row of logits Z: [n, d] → [n, 1]
+ * const m = max(Z, { axis: 1, keepDims: true });
+ * const lse = add(m, log(sum(exp(sub(Z, m)), { axis: 1, keepDims: true })));
+ */
+export function max(aIn, options) {
+  const a = toVar(aIn, 'max operand');
+  const { outer, len, inner, shape, args } = reduction('max', a, options);
+  const A = a.value.data;
+  const out = new Float64Array(outer * inner);
+  const winner = new Int32Array(outer * inner);
   const forward = () => {
-    let s = 0;
-    for (let i = 0; i < n; i++) s += a.value.data[i];
-    out[0] = s / n;
+    for (let o = 0; o < outer; o++) {
+      const base = o * len * inner;
+      for (let i = 0; i < inner; i++) {
+        let at = base + i;
+        let best = A[at];
+        for (let k = 1; k < len && !Number.isNaN(best); k++) {
+          const p = base + k * inner + i;
+          const v = A[p];
+          if (v > best || Number.isNaN(v)) {
+            best = v;
+            at = p;
+          }
+        }
+        out[o * inner + i] = best;
+        winner[o * inner + i] = at;
+      }
+    }
   };
-  const ga = new Float64Array(n);
-  return node({ data: out, shape: [] }, [a], (g) => {
-    ga.fill(g[0] / n);
+  const ga = new Float64Array(A.length);
+  return node({ data: out, shape }, [a], (g) => {
+    ga.fill(0);
+    for (let j = 0; j < winner.length; j++) ga[winner[j]] = g[j];
     return [ga];
-  }, forward, { op: 'mean' });
+  }, forward, args === undefined ? { op: 'max' } : { op: 'max', args });
 }
 
 /**
@@ -543,19 +693,33 @@ export function matmul(aIn, bIn) {
   const shape = vectorRhs ? [m] : [m, n];
   const ga = new Float64Array(m * k);
   const gb = new Float64Array(k * n);
+  const Bt = new Float64Array(k * n);
+  const gbt = new Float64Array(k * n);
   return node({ data: out, shape }, [a, b], (g) => {
-    // Ā = Ḡ Bᵀ, B̄ = Aᵀ Ḡ
+    // Ā = Ḡ Bᵀ, B̄ = Aᵀ Ḡ, walked as (i, j, p) so a zero entry of Ḡ is
+    // skipped whole: it contributes nothing, and a non-finite A or B meeting
+    // it does not become NaN. The p loop runs along rows of A and of Ā; B is
+    // read through its transpose and B̄ is accumulated transposed, so that
+    // loop is contiguous in all four arrays instead of striding by n.
+    for (let p = 0; p < k; p++) {
+      for (let j = 0; j < n; j++) Bt[j * k + p] = B[p * n + j];
+    }
     ga.fill(0);
-    gb.fill(0);
+    gbt.fill(0);
     for (let i = 0; i < m; i++) {
+      const ai = i * k;
       for (let j = 0; j < n; j++) {
         const gij = g[i * n + j];
         if (gij === 0) continue;
+        const bj = j * k;
         for (let p = 0; p < k; p++) {
-          ga[i * k + p] += gij * B[p * n + j];
-          gb[p * n + j] += A[i * k + p] * gij;
+          ga[ai + p] += gij * Bt[bj + p];
+          gbt[bj + p] += A[ai + p] * gij;
         }
       }
+    }
+    for (let p = 0; p < k; p++) {
+      for (let j = 0; j < n; j++) gb[p * n + j] = gbt[j * k + p];
     }
     return [ga, gb];
   }, forward, { op: 'matmul' });
@@ -694,14 +858,18 @@ export function addDiag(aIn, alphaIn) {
  * The everyday use is packing a flat parameter vector, which is what an
  * optimizer or a sampler hands you, into the matrix a model is written in.
  *
+ * A batch of sequences moves between `[n, T, F]`, `[n, T·F]` and `[n·T, F]`
+ * the same way: the last is what lets one matmul apply a weight matrix to
+ * every time step of every sequence at once.
+ *
  * @param {Var|number[]|number[][]} aIn
- * @param {number[]} shape - rank 0, 1 or 2; must hold the same element count
+ * @param {number[]} shape - rank 0 to 3; must hold the same element count
  * @returns {Var}
  */
 export function reshape(aIn, shape) {
   const a = toVar(aIn, 'reshape operand');
-  if (!Array.isArray(shape) || shape.length > 2 || shape.some((d) => !Number.isInteger(d) || d < 1)) {
-    throw new Error('reshape: shape must be up to two positive integers');
+  if (!Array.isArray(shape) || shape.length > MAX_RANK || shape.some((d) => !Number.isInteger(d) || d < 1)) {
+    throw new Error(`reshape: shape must be up to ${MAX_RANK} positive integers`);
   }
   if (sizeOf(shape) !== a.value.data.length) {
     throw new Error(
@@ -749,14 +917,12 @@ export function slice(aIn, start, size) {
     const [n0] = size;
     const out = new Float64Array(n0);
     const forward = () => out.set(src.subarray(s0, s0 + n0));
-    const ga = new Float64Array(src.length);
-    return node({ data: out, shape: [n0] }, [a], (g) => {
-      ga.fill(0);
-      for (let i = 0; i < n0; i++) ga[s0 + i] = g[i];
-      return [ga];
-    }, forward, { op: 'slice', args: [start.slice(), size.slice()] });
+    return node({ data: out, shape: [n0] }, [a], (g) => [(into) => {
+      for (let i = 0; i < n0; i++) into[s0 + i] += g[i];
+    }], forward, { op: 'slice', args: [start.slice(), size.slice()] });
   }
-  const [m, n] = a.shape;
+  if (rank === 3) return slice3(a, start, size);
+  const [, n] = a.shape;
   const [s0, s1] = start;
   const [m0, n0] = size;
   const out = new Float64Array(m0 * n0);
@@ -765,24 +931,56 @@ export function slice(aIn, start, size) {
       for (let j = 0; j < n0; j++) out[i * n0 + j] = src[(s0 + i) * n + (s1 + j)];
     }
   };
-  const ga = new Float64Array(m * n);
-  return node({ data: out, shape: [m0, n0] }, [a], (g) => {
-    ga.fill(0);
+  return node({ data: out, shape: [m0, n0] }, [a], (g) => [(into) => {
     for (let i = 0; i < m0; i++) {
-      for (let j = 0; j < n0; j++) ga[(s0 + i) * n + (s1 + j)] = g[i * n0 + j];
+      for (let j = 0; j < n0; j++) into[(s0 + i) * n + (s1 + j)] += g[i * n0 + j];
     }
-    return [ga];
-  }, forward, { op: 'slice', args: [start.slice(), size.slice()] });
+  }], forward, { op: 'slice', args: [start.slice(), size.slice()] });
+}
+
+/**
+ * A rank-3 block: whole runs along the last axis are copied at once, so one
+ * time step `[n, 1, F]` of a `[n, T, F]` batch costs n copies of F. Like
+ * every slice, its adjoint adds into the parent's gradient in place rather
+ * than returning a dense buffer: T time-step slices of one batch would
+ * otherwise cost O(T²) in the reverse pass. @private
+ */
+function slice3(a, start, size) {
+  const [, d1, d2] = a.shape;
+  const [s0, s1, s2] = start;
+  const [n0, n1, n2] = size;
+  const src = a.value.data;
+  const out = new Float64Array(n0 * n1 * n2);
+  const forward = () => {
+    for (let i = 0; i < n0; i++) {
+      for (let j = 0; j < n1; j++) {
+        const from = ((s0 + i) * d1 + (s1 + j)) * d2 + s2;
+        out.set(src.subarray(from, from + n2), (i * n1 + j) * n2);
+      }
+    }
+  };
+  return node({ data: out, shape: [n0, n1, n2] }, [a], (g) => [(into) => {
+    for (let i = 0; i < n0; i++) {
+      for (let j = 0; j < n1; j++) {
+        const o = (i * n1 + j) * n2;
+        const to = ((s0 + i) * d1 + (s1 + j)) * d2 + s2;
+        for (let k = 0; k < n2; k++) into[to + k] += g[o + k];
+      }
+    }
+  }], forward, { op: 'slice', args: [start.slice(), size.slice()] });
 }
 
 /**
  * Join parts end to end. Scalars and vectors become one vector. Matrices join
  * along `axis`: 0 stacks their rows (same column count), 1 puts them side by
  * side (same row count), which is how a network joins the outputs of two
- * branches for every row of a batch. The adjoint hands each part its slice.
+ * branches for every row of a batch. Rank-3 tensors join along any of their
+ * three axes, every other axis agreeing: axis 1 of `[n, 1, H]` states is how
+ * a recurrent network stacks its steps back into `[n, T, H]`. The adjoint
+ * hands each part its slice.
  *
  * @param {Array<Var|number|number[]|number[][]>} parts
- * @param {{ axis?: number }} [options] - for matrices; 0 by default
+ * @param {{ axis?: number }} [options] - for matrices and rank 3; 0 by default
  * @returns {Var}
  */
 export function concat(parts, options = {}) {
@@ -790,11 +988,14 @@ export function concat(parts, options = {}) {
     throw new Error('concat: needs a non-empty array of parts');
   }
   const vars = parts.map((p, i) => toVar(p, `concat part ${i}`));
-  const rank2 = vars[0].shape.length === 2;
-  if (rank2) return concatMatrices(vars, options.axis ?? 0);
+  const rank = vars[0].shape.length;
+  if (rank === 2) return concatMatrices(vars, options.axis ?? 0);
+  if (rank === 3) return concat3(vars, options.axis ?? 0);
   for (const v of vars) {
     if (v.shape.length > 1) {
-      throw new Error(`concat: parts must all be scalars and vectors, or all matrices; got ${shapeStr(v.shape)}`);
+      throw new Error(
+        `concat: parts must all be scalars and vectors, all matrices, or all rank 3; got ${shapeStr(v.shape)}`,
+      );
     }
   }
   const lengths = vars.map((v) => v.value.data.length);
@@ -877,6 +1078,114 @@ function concatMatrices(vars, axis) {
     }
     return bufs;
   }, forward, { op: 'concat', list: true, args: [{ axis: 1 }] });
+}
+
+/**
+ * Rank-3 tensors along `axis`. Seen as `[outer, block]`, where `outer` is the
+ * product of the axes before `axis` and each part's block is everything from
+ * `axis` on, every part is a run of `outer` contiguous blocks. @private
+ */
+function concat3(vars, axis) {
+  if (axis !== 0 && axis !== 1 && axis !== 2) throw new Error('concat: axis must be 0, 1 or 2 for rank 3');
+  const ref = vars[0].shape;
+  for (const v of vars) {
+    if (v.shape.length !== 3) {
+      throw new Error(`concat: parts must all be rank 3, got ${shapeStr(v.shape)}`);
+    }
+    for (let k = 0; k < 3; k++) {
+      if (k !== axis && v.shape[k] !== ref[k]) {
+        throw new Error(
+          `concat: parts must agree on every axis but ${axis}, got ${shapeStr(ref)} and ${shapeStr(v.shape)}`,
+        );
+      }
+    }
+  }
+  const outer = sizeOf(ref.slice(0, axis));
+  const blocks = vars.map((v) => sizeOf(v.shape.slice(axis)));
+  const width = blocks.reduce((a, b) => a + b, 0);
+  const shape = ref.slice();
+  shape[axis] = vars.reduce((a, v) => a + v.shape[axis], 0);
+  const out = new Float64Array(outer * width);
+  const forward = () => {
+    let off = 0;
+    for (let k = 0; k < vars.length; k++) {
+      const src = vars[k].value.data;
+      const b = blocks[k];
+      for (let o = 0; o < outer; o++) out.set(src.subarray(o * b, o * b + b), o * width + off);
+      off += b;
+    }
+  };
+  const bufs = blocks.map((b) => new Float64Array(outer * b));
+  return node({ data: out, shape }, vars, (g) => {
+    let off = 0;
+    for (let k = 0; k < vars.length; k++) {
+      const b = blocks[k];
+      const buf = bufs[k];
+      for (let o = 0; o < outer; o++) buf.set(g.subarray(o * width + off, o * width + off + b), o * b);
+      off += b;
+    }
+    return bufs;
+  }, forward, { op: 'concat', list: true, args: [{ axis }] });
+}
+
+/**
+ * Pick rows of a table by index: `out[i] = table[index[i]]`. The result has
+ * the index's shape followed by a row's shape, so a `[V, D]` embedding table
+ * gathered at `[n, T]` token ids gives `[n, T, D]`, and a `[K]` vector of
+ * group effects gathered at `[n]` group labels gives `[n]` — a hierarchical
+ * model's `z[site]`.
+ *
+ * The index is not differentiated. It may be a constant, or an input leaf
+ * that changes between calls (a mini-batch of token ids); it is read and
+ * checked on every forward pass. The adjoint scatter-adds back into the
+ * table, so a row picked twice receives both contributions.
+ *
+ * @param {Var|number[]|number[][]} tableIn - rank 1 or 2
+ * @param {Var|number|number[]|number[][]} indexIn - integers in [0, rows)
+ * @returns {Var}
+ *
+ * @example
+ * const mu = add(alpha, gather(siteEffect, siteOfEachRow));
+ */
+export function gather(tableIn, indexIn) {
+  const a = toVar(tableIn, 'gather table');
+  const index = toVar(indexIn, 'gather index');
+  if (a.shape.length === 0) throw new Error('gather: the table cannot be a scalar');
+  const shape = [...index.shape, ...a.shape.slice(1)];
+  if (shape.length > MAX_RANK) {
+    throw new Error(
+      `gather: a ${shapeStr(index.shape)} index into a ${shapeStr(a.shape)} table ` +
+        `would have rank ${shape.length}; the most is ${MAX_RANK}`,
+    );
+  }
+  const rows = a.shape[0];
+  const width = sizeOf(a.shape.slice(1));
+  const m = index.value.data.length;
+  const A = a.value.data;
+  const I = index.value.data;
+  const at = new Int32Array(m);
+  const out = new Float64Array(m * width);
+  const forward = () => {
+    for (let i = 0; i < m; i++) {
+      const r = I[i];
+      if (!Number.isInteger(r) || r < 0 || r >= rows) {
+        throw new Error(`gather: index ${r} at position ${i} is not a row of a table with ${rows} rows`);
+      }
+      at[i] = r;
+      if (width === 1) out[i] = A[r];
+      else out.set(A.subarray(r * width, r * width + width), i * width);
+    }
+  };
+  const ga = new Float64Array(A.length);
+  return node({ data: out, shape }, [a, index], (g) => {
+    ga.fill(0);
+    for (let i = 0; i < m; i++) {
+      const to = at[i] * width;
+      const from = i * width;
+      for (let j = 0; j < width; j++) ga[to + j] += g[from + j];
+    }
+    return [ga, null];
+  }, forward, { op: 'gather' });
 }
 
 export { zeros, sameShape };

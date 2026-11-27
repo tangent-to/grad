@@ -365,6 +365,10 @@ function signatureOf(x) {
   if (Array.isArray(x) || x instanceof Float64Array) {
     const first = x[0];
     if (Array.isArray(first) || first instanceof Float64Array) {
+      const inner = first[0];
+      if (Array.isArray(inner) || inner instanceof Float64Array) {
+        return `${x.length}x${first.length}x${inner.length}`;
+      }
       return `${x.length}x${first.length}`;
     }
     return `v${x.length}`;
@@ -389,6 +393,17 @@ function writeLeaf(leaf, v) {
     return;
   }
   const first = v[0];
+  if (Array.isArray(first) && first.length > 0 && (Array.isArray(first[0]) || first[0] instanceof Float64Array)) {
+    let o = 0;
+    for (let i = 0; i < v.length; i++) {
+      const mat = v[i];
+      for (let j = 0; j < mat.length; j++) {
+        const row = mat[j];
+        for (let k = 0; k < row.length; k++) d[o++] = row[k];
+      }
+    }
+    return;
+  }
   if (Array.isArray(first) || first instanceof Float64Array) {
     let o = 0;
     for (let i = 0; i < v.length; i++) {
@@ -455,6 +470,10 @@ function runPlan(plan, x, feed) {
       const c = contribs[k];
       if (!c) continue;
       const g = nd.parents[k].grad;
+      if (typeof c === 'function') {
+        c(g);
+        continue;
+      }
       for (let j = 0; j < g.length; j++) g[j] += c[j];
     }
   }
@@ -596,7 +615,7 @@ export function compile(f) {
 function shapeSig(shape) {
   if (shape.length === 0) return 's';
   if (shape.length === 1) return `v${shape[0]}`;
-  return `${shape[0]}x${shape[1]}`;
+  return shape.join('x');
 }
 
 /** @private */

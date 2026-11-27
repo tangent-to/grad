@@ -19,10 +19,14 @@ export class Var {
   /**
    * @param {import('./tensor.js').Tensor} value - forward value
    * @param {Var[]} [parents] - inputs this node was computed from
-   * @param {(g: Float64Array) => Array<Float64Array|null>} [backward] - given the
-   *   gradient of the root w.r.t. this node's value, return the contribution to
-   *   each parent, in `parents` order. `null` skips a parent (e.g. an integer
-   *   index argument), which is cheaper than allocating a zero buffer.
+   * @param {(g: Float64Array) => Array<Float64Array|null|((into: Float64Array) => void)>} [backward] -
+   *   given the gradient of the root w.r.t. this node's value, return the
+   *   contribution to each parent, in `parents` order. `null` skips a parent
+   *   (e.g. an integer index argument), which is cheaper than allocating a
+   *   zero buffer. A function is an accumulator: it adds its contribution into
+   *   the parent's gradient itself, for an op that touches only a small part
+   *   of a large parent — one time step sliced from a whole sequence batch —
+   *   and should not pay for a dense buffer the size of that parent.
    * @param {(() => void)|null} [recompute] - recompute this node's forward
    *   value IN PLACE from its parents' current values. Present on every op,
    *   absent on leaves. `compile()` replays a graph through these; see the
@@ -94,6 +98,10 @@ export class Var {
         const c = contribs[k];
         if (!c) continue;
         const g = node.parents[k].grad;
+        if (typeof c === 'function') {
+          c(g);
+          continue;
+        }
         for (let j = 0; j < g.length; j++) g[j] += c[j];
       }
     }
