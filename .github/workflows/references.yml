@@ -30,9 +30,9 @@ jobs:
       - uses: r-lib/actions/setup-r@v2
       - run: Rscript -e 'install.packages("jsonlite", repos = "https://cloud.r-project.org")'
       - run: npm install --no-fund --no-audit
+      - run: mkdir -p "$RUNNER_TEMP/committed" && cp tests/fixtures/nd-*.json "$RUNNER_TEMP/committed/"
       - run: npm run references
-      # Regenerated values may differ from the committed ones in the last bits
-      # across platforms; the tests compare to a tolerance, so show the diff
-      # for the record and let the tests decide.
-      - run: git diff --stat tests/fixtures || true
+      # Library versions differ from the ones that wrote the committed
+      # fixtures; compare the numbers, not the files, and fail if any moved.
+      - run: node tests/references/compare_fixtures.mjs "$RUNNER_TEMP/committed" tests/fixtures
       - run: npm run test:run
