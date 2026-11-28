@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-28
+
 ### Added
 - **Tensors of any rank.** Nested arrays of any depth are read and written
   like rows, and plans are keyed by the full shape. The elementwise ops,
@@ -38,9 +40,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the index followed by a row, with a scatter-add adjoint: an embedding
   lookup, or a hierarchical model's `z[site]`. The index may be a constant or
   an input leaf, and is validated on every forward pass.
+
+### Changed
+- `slice` no longer allocates and accumulates a gradient buffer the size of
+  its whole parent: its adjoint adds into the touched entries only. A
+  recurrent network slicing T steps from one batch paid O(T²) for that in the
+  reverse pass.
+- `matmul`'s reverse pass reads and writes contiguously; about 15% faster on
+  a 300 × 300 product, and on the recurrent shapes above.
+
+### Fixed
+- A compiled plan checks the shape of nested arrays as it writes them. The
+  plan is chosen by the first entry at each level, and the write trusted it,
+  so a ragged later row (`[[1, 2], [3]]` after `[[1, 2], [3, 4]]`) silently
+  reused the previous call's values; it now throws, naming the parameter or
+  input and the row. This dates from 0.3's matrices.
+- `valueAndGradFns`'s cache copies parameters at every depth. It copied two
+  levels, so editing a rank-3 parameter in place changed the cached copy too
+  and returned the old value and gradient.
+- An argument nested three or more levels deep was read as a matrix whose
+  entries were arrays, and returned NaN without an error; it is now a tensor
+  of that rank, and its plan is keyed by the full shape.
+
+### Validation
+- The n-dimensional ops are checked against PyTorch (values and autograd
+  gradients) and base R (values), in float64, on 492 cases: 102 chosen by
+  hand with asymmetric shapes, and 390 drawn from a fixed seed over ranks 0
+  to 5, every op, both operand orders and every kind of matmul. The fixtures
+  are committed and `npm run references` regenerates them; a workflow reruns
+  the references themselves on pull requests and weekly.
+- Plans serialized by 0.3.2 rebuild and give 0.3.2's values and gradients.
+- `npm run test:dist` runs the whole suite against the minified bundle.
+
+## [0.3.2] - 2026-11-27
+
+### Fixed
+- `compileFromJSON` defers op evaluation until the restored plan receives real
+  parameters and inputs, so domain-sensitive ops such as `cholesky` and
+  `solveGeneral` succeed on serialized positive-definite matrix objectives.
+- The shared value and gradient cache compares matrix entries and tensor
+  shapes by value, including after in-place parameter edits.
+
+## [0.3.1] - 2026-09-22
+
+### Added
 - `concat` joins matrices as well as vectors: along rows (`axis: 0`), or
   side by side along columns (`axis: 1`), which is how a network joins two
   branches for every row of a batch. The axis is serialized with the plan.
+
+## [0.3.0] - 2026-09-22
+
+### Added
 - **Inputs.** An objective may take a second argument, a `{name: value}` map
   of leaves that are not differentiated and change between calls: a
   mini-batch, a dropout mask, a per-fit coefficient. `valueAndGrad(f)(x,
@@ -69,39 +119,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inputs are part of the signature.
 - `compile(f).toJSON()` writes the plan of the shapes most recently
   evaluated, there being several.
-- `slice` no longer allocates and accumulates a gradient buffer the size of
-  its whole parent: its adjoint adds into the touched entries only. A
-  recurrent network slicing T steps from one batch paid O(T²) for that in the
-  reverse pass.
-- `matmul`'s reverse pass reads and writes contiguously; about 15% faster on
-  a 300 × 300 product, and on the recurrent shapes above.
 
 ### Fixed
-- A compiled plan checks the shape of nested arrays as it writes them. The
-  plan is chosen by the first entry at each level, and the write trusted it,
-  so a ragged later row (`[[1, 2], [3]]` after `[[1, 2], [3, 4]]`) silently
-  reused the previous call's values; it now throws, naming the parameter or
-  input and the row. This dates from 0.3's matrices.
-- `valueAndGradFns`'s cache copies parameters at every depth. It copied two
-  levels, so editing a rank-3 parameter in place changed the cached copy too
-  and returned the old value and gradient.
-- An argument nested three or more levels deep was read as a matrix whose
-  entries were arrays, and returned NaN without an error; it is now a tensor
-  of that rank, and its plan is keyed by the full shape.
-- `compileFromJSON` defers op evaluation until the restored plan receives real
-  parameters and inputs, so domain-sensitive ops such as `cholesky` and
-  `solveGeneral` succeed on serialized positive-definite matrix objectives.
-- The shared value and gradient cache compares matrix entries and tensor
-  shapes by value, including after in-place parameter edits.
 - The zero gradient reported for a matrix parameter the objective never reads
   was a flat array; it is now nested rows, the form the parameter arrived in.
 
-### Validation
-- The n-dimensional ops are checked against PyTorch (values and autograd
-  gradients) and base R (values), in float64, on 492 cases: 102 chosen by
-  hand with asymmetric shapes, and 390 drawn from a fixed seed over ranks 0
-  to 5, every op, both operand orders and every kind of matmul. The fixtures
-  are committed and `npm run references` regenerates them; a workflow reruns
-  the references themselves on pull requests and weekly.
-- Plans serialized by 0.3.2 rebuild and give 0.3.2's values and gradients.
-- `npm run test:dist` runs the whole suite against the minified bundle.
+[Unreleased]: https://github.com/tangent-to/grad/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/tangent-to/grad/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/tangent-to/grad/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/tangent-to/grad/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/tangent-to/grad/compare/v0.2.0...v0.3.0
